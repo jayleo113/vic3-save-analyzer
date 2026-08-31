@@ -55,8 +55,10 @@ C:\Users\<username>\Documents\Paradox Interactive\Victoria 3\save games
 Desktop exports are copied to:
 
 ```text
-C:\Users\<username>\Desktop\Victoria3存档报告\<save_name_timestamp>\
+C:\Users\<username>\Desktop\Victoria3存档报告\<country>_<game-date>\
 ```
+
+Every exported file is also prefixed with the save's in-game country and in-game date, for example `SWI_1858-08-04_systems_wars.csv`. Repeated exports of the same in-game date keep that label and only add a simple repeat suffix to the desktop folder when needed.
 
 ## Output Folders
 

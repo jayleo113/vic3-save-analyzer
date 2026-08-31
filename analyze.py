@@ -374,6 +374,44 @@ def meta(txt: str) -> dict[str, object]:
     }
 
 
+def safe_filename_part(value: object, fallback: str = "UNKNOWN") -> str:
+    text = str(value or "").strip().strip('"') or fallback
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text)
+    text = re.sub(r"\s+", "_", text)
+    text = text.strip("._ ")
+    return text[:80] or fallback
+
+
+def normalize_game_date(value: object) -> str:
+    text = str(value or "").strip().strip('"')
+    match = re.match(r"^(\d{1,5})\.(\d{1,2})\.(\d{1,2})$", text)
+    if match:
+        year, month, day = match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    return safe_filename_part(text, "DATE_UNKNOWN")
+
+
+def save_identity(meta_info: dict[str, object], countries: dict[int, dict] | None = None, player_id: int | None = None) -> dict[str, str]:
+    country = str(meta_info.get("country") or "").strip()
+    if countries and player_id is not None and player_id in countries:
+        country = str(countries[player_id].get("tag") or country)
+    country = safe_filename_part(country, "COUNTRY_UNKNOWN").upper()
+    date = normalize_game_date(meta_info.get("date"))
+    return {
+        "country": country,
+        "date": date,
+        "label": f"{country}_{date}",
+    }
+
+
+def save_output_stem(path: Path, meta_info: dict[str, object], countries: dict[int, dict] | None = None, player_id: int | None = None, suffix: str = "") -> str:
+    identity = save_identity(meta_info, countries, player_id)
+    base = identity["label"]
+    if base == "COUNTRY_UNKNOWN_DATE_UNKNOWN":
+        base = safe_filename_part(path.stem)
+    return f"{base}{suffix}"
+
+
 def num(value: str | None) -> float | None:
     if not value:
         return None
@@ -1766,12 +1804,11 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
             progress(percent, label)
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"{path.stem}_{stamp}_systems"
     mark(5, "读取存档元数据")
     meta_info = meta(txt)
     countries = parse_countries(txt)
     player_id = player_country_id(txt, countries, str(meta_info["country"]))
+    stem = save_output_stem(path, meta_info, countries, player_id, "_systems")
     rankings = parse_rankings(txt, countries)
     major_ids = select_major_country_ids(countries, rankings, player_id, limit)
     major_set = set(major_ids)
@@ -2093,11 +2130,10 @@ def sol_text(value) -> str:
 
 def build_report(path: Path, txt: str, full_pops: bool = False) -> tuple[Path, dict[str, Path]]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"{path.stem}_{stamp}"
     meta_info = meta(txt)
     countries = parse_countries(txt)
     player_id = player_country_id(txt, countries, str(meta_info["country"]))
+    stem = save_output_stem(path, meta_info, countries, player_id)
     player = countries.get(player_id) if player_id is not None else None
     rankings = parse_rankings(txt, countries)
     laws = parse_laws(txt, player_id) if player_id is not None else []

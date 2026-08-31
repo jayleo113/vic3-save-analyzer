@@ -281,8 +281,22 @@ def normalize_chat_endpoint(config: dict) -> str:
     return base_url + endpoint
 
 
-def prepare_desktop_output(path: Path) -> Path:
-    run_dir = DESKTOP_REPORT_ROOT / f"{path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+def unique_directory(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.name}_第{index}次导出")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.name}_{datetime.now().strftime('%H%M%S')}")
+
+
+def prepare_desktop_output(path: Path, txt: str) -> Path:
+    meta_info = analyze.meta(txt)
+    countries = analyze.parse_countries(txt)
+    player_id = analyze.player_country_id(txt, countries, str(meta_info["country"]))
+    identity = analyze.save_identity(meta_info, countries, player_id)
+    run_dir = unique_directory(DESKTOP_REPORT_ROOT / identity["label"])
     run_dir.mkdir(parents=True, exist_ok=True)
     analyze.REPORT_DIR = run_dir
     return run_dir
@@ -335,11 +349,11 @@ def run_combined_export() -> None:
     progress.start()
     try:
         progress(1, "找到最新存档")
-        run_dir = prepare_desktop_output(path)
-        progress(3, "创建桌面分类目录")
         progress(5, "读取并展开存档")
         txt = analyze.read_save(path)
         progress(18, "存档读取完成")
+        run_dir = prepare_desktop_output(path, txt)
+        progress(20, "创建桌面分类目录")
         quick_report, quick_outputs = analyze.build_report(path, txt, full_pops=False)
         progress(28, "快速报告完成")
         document, outputs = analyze.build_system_export(
@@ -476,11 +490,11 @@ def run_api_analysis(config: dict) -> None:
     progress.start()
     try:
         progress(1, "找到最新存档")
-        run_dir = prepare_desktop_output(path)
-        progress(3, "创建桌面分类目录")
         progress(5, "读取并展开存档")
         txt = analyze.read_save(path)
         progress(18, "存档读取完成")
+        run_dir = prepare_desktop_output(path, txt)
+        progress(20, "创建桌面分类目录")
         document, outputs = analyze.build_system_export(
             path,
             txt,

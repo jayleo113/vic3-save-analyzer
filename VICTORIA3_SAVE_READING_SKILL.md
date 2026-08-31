@@ -11,7 +11,8 @@ Use this project-local skill when the user asks to read, parse, export, compare,
 
 - Formal/local tool folder: the repository root.
 - Advanced/dev copy: optional local copy under the user's Desktop.
-- User-facing output: `%USERPROFILE%\Desktop\Victoria3存档报告\<save_name_timestamp>\`
+- User-facing output: `%USERPROFILE%\Desktop\Victoria3存档报告\<country>_<game-date>\`
+- Exported files must be prefixed with the save's in-game country and in-game date, for example `SWI_1858-08-04_systems_wars.csv`.
 - API config: `%USERPROFILE%\.vic3-save-analyzer\api_config.json`
 
 ## Main User Intent
