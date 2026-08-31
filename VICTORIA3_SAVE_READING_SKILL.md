@@ -30,6 +30,7 @@ Default report framing:
 - Interest groups and class politics
 - Technology and modernization
 - Diplomacy, pacts, wars, and historical wars
+- Diplomatic plays, war goals, formations, battles, casualties, war costs, occupation, and state devastation
 - Machine-readable JSON index
 
 Avoid defaulting to "what should I do next". Only give strategy advice when the user explicitly asks for it.
@@ -92,6 +93,12 @@ Important fixed outputs:
 - `*_systems_pacts.csv`
 - `*_systems_wars.csv`
 - `*_systems_war_participants.csv`
+- `*_systems_diplomatic_plays.csv`
+- `*_systems_war_costs.csv`
+- `*_systems_war_goals.csv`
+- `*_systems_military_formations.csv`
+- `*_systems_battles.csv`
+- `*_systems_battle_casualties.csv`
 - `*_systems_summary.json`
 
 ## Parser Principles
@@ -139,7 +146,12 @@ Diplomacy and war:
 - Relations, pacts, obligations, truce, last action
 - War total table with active and historical wars
 - War participant table with war support and exhaustion deltas
-- Diplomatic plays and fronts may be added later, but war tables should never be removed.
+- Diplomatic play table with initiator/target sides and escalation
+- War goal table with holder, creator, target country, target state/region, and status
+- Military formation table with army/navy type, unit types, mobilization options, organization, supply, and locations
+- Battle table with date, location, victory status, battalions, manpower, casualties, captured provinces, and occupation/lost province fields
+- Battle casualty table by country and culture
+- State devastation should be kept in the state table
 
 ## Editing Guidance
 

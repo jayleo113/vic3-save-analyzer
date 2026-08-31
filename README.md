@@ -18,7 +18,8 @@ Victoria 3, Vic3, Victoria 3 save analyzer, Victoria 3 save parser, Vic3 save re
 - Adds GDP share, GDP per capita, GDP history, prestige history, literacy history, and standard-of-living history.
 - Exports companies and enterprise productivity trends.
 - Exports population by job, culture, religion, loyalists, radicals, workforce, and dependents.
-- Exports laws, interest groups, technology, relations, pacts, wars, and historical wars.
+- Exports laws, interest groups, technology, relations, pacts, diplomatic plays, war goals, armies/navies, battles, casualties, wars, and historical wars.
+- Shows progress percentage and estimated remaining time in the one-click desktop exporter.
 - Optional DeepSeek/OpenAI-compatible API report mode for classified tables.
 
 ## Quick Start
@@ -92,6 +93,12 @@ Important outputs:
 | `*_systems_pacts.csv` | diplomatic pacts and actions |
 | `*_systems_wars.csv` | active and historical wars |
 | `*_systems_war_participants.csv` | war support and exhaustion by participating country |
+| `*_systems_diplomatic_plays.csv` | diplomatic play sides, escalation, region, linked war |
+| `*_systems_war_costs.csv` | material, wage, and known total war cost |
+| `*_systems_war_goals.csv` | war goals, holders, creators, targets, status |
+| `*_systems_military_formations.csv` | armies/navies, unit types, mobilization options, supply |
+| `*_systems_battles.csv` | battle location, dates, victory, manpower, battalions, casualties |
+| `*_systems_battle_casualties.csv` | battle casualties by country and culture |
 | `*_systems_summary.json` | machine-readable index |
 
 ## Command Line

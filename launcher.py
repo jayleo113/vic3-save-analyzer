@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -48,6 +49,24 @@ PROVIDERS = {
 }
 DEFAULT_PROVIDER = PROVIDERS["1"]
 DESKTOP_REPORT_ROOT = Path.home() / "Desktop" / "Victoria3存档报告"
+
+
+class ProgressPrinter:
+    def __init__(self) -> None:
+        self.started = time.time()
+        self.last_percent = -1
+
+    def __call__(self, percent: int, label: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        elapsed = max(time.time() - self.started, 0.1)
+        if percent > 0:
+            remaining = max((elapsed / percent) * (100 - percent), 0)
+            eta = f"{int(remaining // 60):02d}:{int(remaining % 60):02d}"
+        else:
+            eta = "--:--"
+        if percent != self.last_percent:
+            print(f"[{percent:3d}%] {label}，预计剩余 {eta}")
+            self.last_percent = percent
 
 
 def clear() -> None:
@@ -208,7 +227,21 @@ def categorize_run_outputs(run_dir: Path, quick_report: Path | None, quick_outpu
         "02_快速报告": ["summary_json", "countries_csv", "great_powers_csv", "states_csv", "buildings_csv", "laws_csv"],
         "03_经济公司": ["major_countries", "building_summary", "building_details", "companies"],
         "04_人口社会": ["population_summary", "population_by_type", "population_by_culture", "population_by_religion", "pops_csv", "pops_by_type_csv", "pops_by_culture_csv", "pops_by_religion_csv"],
-        "05_制度外交科技战争": ["laws", "interest_groups", "technology", "relations", "pacts", "wars", "war_participants"],
+        "05_制度外交科技战争": [
+            "laws",
+            "interest_groups",
+            "technology",
+            "relations",
+            "pacts",
+            "wars",
+            "war_participants",
+            "diplomatic_plays",
+            "war_costs",
+            "war_goals",
+            "military_formations",
+            "battles",
+            "battle_casualties",
+        ],
         "06_机器数据": ["systems_summary"],
     }
     if quick_report:
@@ -225,11 +258,17 @@ def run_combined_export() -> None:
     if not path:
         print("没有找到 Victoria 3 存档。")
         return
+    progress = ProgressPrinter()
+    progress(1, "找到最新存档")
     run_dir = prepare_desktop_output(path)
+    progress(3, "创建桌面分类目录")
     txt = analyze.read_save(path)
+    progress(18, "存档读取完成")
     quick_report, quick_outputs = analyze.build_report(path, txt, full_pops=False)
-    document, outputs = analyze.build_system_export(path, txt, limit=30, full_pops=True)
+    progress(28, "快速报告完成")
+    document, outputs = analyze.build_system_export(path, txt, limit=30, full_pops=True, progress=lambda p, label: progress(28 + int(p * 0.68), label))
     categorize_run_outputs(run_dir, quick_report, quick_outputs, outputs)
+    progress(100, "分类复制完成")
     print("\n一键导出完成。")
     print(f"桌面分类目录：{run_dir}")
     print(f"快速报告：{quick_report}")
@@ -274,6 +313,12 @@ def compact_system_bundle_for_api(document: Path, outputs: dict[str, Path]) -> s
         "pacts": 35_000,
         "wars": 45_000,
         "war_participants": 45_000,
+        "diplomatic_plays": 45_000,
+        "war_costs": 45_000,
+        "war_goals": 45_000,
+        "military_formations": 45_000,
+        "battles": 45_000,
+        "battle_casualties": 45_000,
     }
     for key, max_chars in csv_limits.items():
         path = outputs.get(key)
@@ -299,7 +344,8 @@ def call_chat_api(config: dict, content: str) -> str:
                 "role": "user",
                 "content": (
                     "请生成一份分类数据报表，不要先做分析。按固定栏目输出：国家总表、GDP占比、历史变化、"
-                    "公司与企业、建筑部门、人口职业、文化宗教、法律制度、利益集团、科技、外交关系。"
+                    "公司与企业、建筑部门、人口职业、文化宗教、法律制度、利益集团、科技、外交关系、"
+                    "外交博弈、战争目标、军队编成、战斗记录、伤亡、战争成本、占领推进和州破坏度。"
                     "战争和历史战争必须融入外交与国家分表，列出战争状态、起止时间、参战方、战争支持度和消耗。"
                     "每一类先给表格，再给极短字段说明；不要提出下一步玩法。\n\n"
                     + content
@@ -338,11 +384,16 @@ def run_api_analysis(config: dict) -> None:
     if not path:
         print("没有找到 Victoria 3 存档。")
         return
+    progress = ProgressPrinter()
+    progress(1, "找到最新存档")
     run_dir = prepare_desktop_output(path)
+    progress(3, "创建桌面分类目录")
     txt = analyze.read_save(path)
-    document, outputs = analyze.build_system_export(path, txt, limit=30, full_pops=True)
+    progress(18, "存档读取完成")
+    document, outputs = analyze.build_system_export(path, txt, limit=30, full_pops=True, progress=lambda p, label: progress(18 + int(p * 0.55), label))
     categorize_run_outputs(run_dir, None, {}, outputs)
-    print("本地体系数据已导出，正在调用 API 生成分类报表...")
+    progress(75, "本地体系数据已分类")
+    print("正在调用 API 生成分类报表...")
     api_content = compact_system_bundle_for_api(document, outputs)
     try:
         answer = call_chat_api(config, api_content)
@@ -354,6 +405,7 @@ def run_api_analysis(config: dict) -> None:
     out = document.with_name(document.stem + "_api_tables.md")
     out.write_text("# API 深挖分类报表\n\n" + answer + "\n", encoding="utf-8")
     copy_to_category(out, run_dir / "01_总览文档")
+    progress(100, "API 报表完成")
     print("\nAPI 报表完成。")
     print(f"桌面分类目录：{run_dir}")
     print(f"API报表：{out}")

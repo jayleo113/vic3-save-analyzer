@@ -208,6 +208,17 @@ def iter_top_blocks(txt: str, start: int, end: int):
             pos = value_pos
 
 
+def iter_anonymous_blocks(txt: str):
+    pos = 0
+    while pos < len(txt):
+        open_pos = txt.find("{", pos)
+        if open_pos < 0:
+            return
+        close = brace_span(txt, open_pos)
+        yield txt[open_pos + 1 : close]
+        pos = close + 1
+
+
 def database_block(txt: str, manager: str) -> str | None:
     manager_block = top_level_block(txt, manager)
     if not manager_block:
@@ -552,6 +563,9 @@ def parse_all_states(txt: str, countries: dict[int, dict]) -> tuple[list[dict], 
                 "incorporation": num(top_value(block, "incorporation")),
                 "infrastructure": num(top_value(block, "infrastructure")),
                 "infrastructure_usage": num(top_value(block, "infrastructure_usage")),
+                "trade_capacity": num(top_value(block, "trade_capacity")),
+                "trade_capacity_usage": num(top_value(block, "trade_capacity_usage")),
+                "devastation": num(top_value(block, "devastation")),
                 "bureaucracy_cost": num(top_value(block, "base_pop_bureaucracy_cost")),
                 "previous_country": top_value(block, "previous_country_definition") or "",
                 "last_owner_change": top_value(block, "last_owner_change") or "",
@@ -1165,6 +1179,239 @@ def parse_wars_for_countries(txt: str, countries: dict[int, dict], country_ids: 
     )
 
 
+def parse_war_goals_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int]) -> list[dict]:
+    db = database_block(txt, "war_goal_manager")
+    if not db:
+        return []
+    rows = []
+    for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
+        if not key.isdigit():
+            continue
+        block = db[open_pos + 1 : close]
+        holder = top_value(block, "holder") or ""
+        creator = top_value(block, "creator") or ""
+        target = subblock(block, "target") or ""
+        target_country = top_value(target, "country") or ""
+        ids = [value for value in (holder, creator, target_country) if value.isdigit()]
+        if not any(int(value) in country_ids for value in ids):
+            continue
+        rows.append(
+            {
+                "war_goal_id": int(key),
+                "type": top_value(block, "type") or "",
+                "holder_id": holder,
+                "holder_tag": countries.get(int(holder), {}).get("tag", holder) if holder.isdigit() else holder,
+                "creator_id": creator,
+                "creator_tag": countries.get(int(creator), {}).get("tag", creator) if creator.isdigit() else creator,
+                "target_country_id": target_country,
+                "target_country_tag": countries.get(int(target_country), {}).get("tag", target_country) if target_country.isdigit() else target_country,
+                "target_state": top_value(target, "state") or "",
+                "target_region": top_value(target, "region") or "",
+                "target_other": top_value(target, "other") or "",
+                "diplomatic_play": top_value(block, "diplomatic_play") or "",
+                "demand_type": top_value(block, "demand_type") or "",
+                "status": top_value(block, "status") or "",
+                "initial_war_goal": top_value(block, "initial_war_goal") or "",
+            }
+        )
+    return sorted(rows, key=lambda row: (row["diplomatic_play"], row["holder_tag"], row["type"]))
+
+
+def parse_diplomatic_plays_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int]) -> tuple[list[dict], list[dict]]:
+    db = database_block(txt, "diplomatic_plays")
+    if not db:
+        return [], []
+    play_rows = []
+    cost_rows = []
+    for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
+        if not key.isdigit():
+            continue
+        block = db[open_pos + 1 : close]
+        ids = set()
+        for value in [top_value(block, "initiator"), top_value(block, "target"), *list_value(block, "initiators"), *list_value(block, "targets"), *list_value(block, "involved")]:
+            if value and value.isdigit():
+                ids.add(int(value))
+        if not ids.intersection(country_ids):
+            continue
+        country_records = subblock(block, "country_records") or ""
+        for item in iter_anonymous_blocks(country_records):
+            country = top_value(item, "country")
+            if not country or not country.isdigit():
+                continue
+            country_id = int(country)
+            if country_id not in country_ids:
+                continue
+            material_cost = sum(float(value) for value in re.findall(r"value=(-?\d+(?:\.\d+)?)", subblock(item, "materiel_cost_of_war") or ""))
+            cost_rows.append(
+                {
+                    "diplomatic_play": int(key),
+                    "country_id": country_id,
+                    "tag": countries.get(country_id, {}).get("tag", ""),
+                    "side": top_value(item, "side") or "",
+                    "materiel_cost_of_war": material_cost,
+                    "wage_cost_of_war": num(top_value(item, "wage_cost_of_war")),
+                    "total_known_war_cost": material_cost + (num(top_value(item, "wage_cost_of_war")) or 0),
+                }
+            )
+        play_rows.append(
+            {
+                "diplomatic_play": int(key),
+                "type": top_value(block, "type") or "",
+                "state": top_value(block, "state") or "",
+                "strategic_region": top_value(block, "strategic_region") or "",
+                "initiator_id": top_value(block, "initiator") or "",
+                "initiator_tag": countries.get(int(top_value(block, "initiator") or -1), {}).get("tag", top_value(block, "initiator") or ""),
+                "target_id": top_value(block, "target") or "",
+                "target_tag": countries.get(int(top_value(block, "target") or -1), {}).get("tag", top_value(block, "target") or ""),
+                "initiator_side_tags": ";".join(countries.get(int(value), {}).get("tag", value) for value in list_value(block, "initiators") if value.isdigit()),
+                "target_side_tags": ";".join(countries.get(int(value), {}).get("tag", value) for value in list_value(block, "targets") if value.isdigit()),
+                "involved_tags": ";".join(countries.get(int(value), {}).get("tag", value) for value in list_value(block, "involved") if value.isdigit()),
+                "war": top_value(block, "war") or "",
+                "escalation": num(top_value(block, "escalation")),
+                "start_date": top_value(block, "start_date") or "",
+                "end_date": top_value(block, "end_date") or "",
+            }
+        )
+    return (
+        sorted(play_rows, key=lambda row: (row["end_date"] in {"", "1.1.1"}, row["start_date"], row["diplomatic_play"]), reverse=True),
+        sorted(cost_rows, key=lambda row: (row["tag"], row["diplomatic_play"])),
+    )
+
+
+def parse_military_formations_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int]) -> list[dict]:
+    db = database_block(txt, "military_formation_manager")
+    if not db:
+        return []
+    rows = []
+    for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
+        if not key.isdigit():
+            continue
+        block = db[open_pos + 1 : close]
+        country = top_value(block, "country")
+        if not country or not country.isdigit() or int(country) not in country_ids:
+            continue
+        current = subblock(block, "current_location") or ""
+        target = subblock(block, "target_location") or ""
+        rows.append(
+            {
+                "formation_id": int(key),
+                "country_id": int(country),
+                "tag": countries.get(int(country), {}).get("tag", ""),
+                "type": top_value(block, "type") or "",
+                "ordinal_number": top_value(block, "ordinal_number") or "",
+                "home_hq": top_value(block, "home_hq") or "",
+                "supply_hub": top_value(block, "supply_hub") or "",
+                "organization": num(top_value(block, "organization")),
+                "supply": num(top_value(block, "supply")),
+                "delivered_supply": num(top_value(block, "delivered_supply")),
+                "supply_priority": top_value(block, "supply_priority") or "",
+                "flags": ";".join(list_value(block, "flags")),
+                "default_unit_types": ";".join(list_value(block, "default_unit_types")),
+                "unit_type_count": len(list_value(block, "default_unit_types")),
+                "mobilization_options": ";".join(list_value(block, "active_mobilization_options")),
+                "mobilization_option_count": len(list_value(block, "active_mobilization_options")),
+                "current_location_type": top_value(current, "type") or "",
+                "current_location_id": top_value(current, "identity") or "",
+                "target_location_type": top_value(target, "type") or "",
+                "target_location_id": top_value(target, "identity") or "",
+                "creation_date": top_value(block, "creation_date") or "",
+                "ai_tag": top_value(block, "ai_tag") or "",
+            }
+        )
+    return sorted(rows, key=lambda row: (row["tag"], row["type"], row["formation_id"]))
+
+
+def battle_side_stats(side_block: str | None) -> dict[str, object]:
+    block = side_block or ""
+    stats = subblock(block, "statistics") or ""
+    return {
+        "country": top_value(block, "country") or "",
+        "formation": top_value(block, "formation") or "",
+        "commander": top_value(block, "commander") or "",
+        "order_type": top_value(block, "order_type") or "",
+        "battle_condition": top_value(block, "battle_condition") or "",
+        "dead": sum(int(value) for value in re.findall(r"num_dead=(\d+)", stats)),
+        "wounded": sum(int(value) for value in re.findall(r"num_wounded=(\d+)", stats)),
+        "demoralized": sum(int(value) for value in re.findall(r"num_demoralized=(\d+)", stats)),
+    }
+
+
+def parse_battles_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int], culture_map: dict[str, str]) -> tuple[list[dict], list[dict]]:
+    db = database_block(txt, "battle_manager")
+    if not db:
+        return [], []
+    battle_rows = []
+    casualty_rows = []
+    for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
+        if not key.isdigit():
+            continue
+        block = db[open_pos + 1 : close]
+        data = subblock(block, "battle_data") or ""
+        attacker = battle_side_stats(subblock(data, "attacker"))
+        defender = battle_side_stats(subblock(data, "defender"))
+        side_ids = [int(v) for v in (attacker["country"], defender["country"]) if str(v).isdigit()]
+        if not any(country_id in country_ids for country_id in side_ids):
+            continue
+        name_match = re.search(r'key="STATE_REGION_NAME"\s+value="([^"]+)"', block)
+        battle_rows.append(
+            {
+                "battle_id": int(key),
+                "war_id": top_value(block, "war") or "",
+                "front": top_value(block, "front") or "",
+                "type": top_value(block, "type") or "",
+                "state_region": name_match.group(1) if name_match else "",
+                "province": top_value(block, "province") or "",
+                "attacker_country_id": attacker["country"],
+                "attacker_tag": countries.get(int(attacker["country"]), {}).get("tag", attacker["country"]) if str(attacker["country"]).isdigit() else attacker["country"],
+                "defender_country_id": defender["country"],
+                "defender_tag": countries.get(int(defender["country"]), {}).get("tag", defender["country"]) if str(defender["country"]).isdigit() else defender["country"],
+                "status": top_value(block, "status") or "",
+                "start_date": top_value(block, "start_date") or "",
+                "end_date": top_value(block, "end_date") or "",
+                "attacker_start_battalions": num(top_value(block, "attacker_start_battalions")),
+                "defender_start_battalions": num(top_value(block, "defender_start_battalions")),
+                "attacker_starting_manpower": num(top_value(block, "attacker_starting_manpower")),
+                "defender_starting_manpower": num(top_value(block, "defender_starting_manpower")),
+                "attacker_ending_manpower": num(top_value(block, "attacker_ending_manpower")),
+                "defender_ending_manpower": num(top_value(block, "defender_ending_manpower")),
+                "attacker_dead": attacker["dead"],
+                "attacker_wounded": attacker["wounded"],
+                "defender_dead": defender["dead"],
+                "defender_wounded": defender["wounded"],
+                "num_captured_provinces": num(top_value(block, "num_captured_provinces")),
+                "capturing_country": top_value(block, "capturing_country") or "",
+                "lost_provinces_country": top_value(block, "lost_provinces_country") or "",
+            }
+        )
+        for side_name, side_block in (("attacker", subblock(data, "attacker")), ("defender", subblock(data, "defender"))):
+            if not side_block:
+                continue
+            country = top_value(side_block, "country") or ""
+            if not country.isdigit() or int(country) not in country_ids:
+                continue
+            stats = subblock(side_block, "statistics") or ""
+            for item in iter_anonymous_blocks(stats):
+                culture = top_value(item, "culture") or ""
+                casualty_rows.append(
+                    {
+                        "battle_id": int(key),
+                        "war_id": top_value(block, "war") or "",
+                        "side": side_name,
+                        "country_id": int(country),
+                        "tag": countries.get(int(country), {}).get("tag", ""),
+                        "culture": culture_map.get(culture, culture),
+                        "raw_culture": culture,
+                        "dead": int(num(top_value(item, "num_dead")) or 0),
+                        "wounded": int(num(top_value(item, "num_wounded")) or 0),
+                        "demoralized": int(num(top_value(item, "num_demoralized")) or 0),
+                    }
+                )
+    return (
+        sorted(battle_rows, key=lambda row: (row["war_id"], row["start_date"], row["battle_id"])),
+        sorted(casualty_rows, key=lambda row: (row["tag"], row["war_id"], row["battle_id"], row["side"])),
+    )
+
+
 def pct(value) -> str:
     if value is None or value == "":
         return "NA"
@@ -1285,6 +1532,12 @@ def write_system_document(
     company_rows: list[dict],
     war_rows: list[dict],
     war_participant_rows: list[dict],
+    diplomatic_play_rows: list[dict],
+    war_cost_rows: list[dict],
+    war_goal_rows: list[dict],
+    military_formation_rows: list[dict],
+    battle_rows: list[dict],
+    battle_casualty_rows: list[dict],
 ) -> None:
     lines = [
         "# 维多利亚 3 主要国家体系化档案",
@@ -1349,6 +1602,12 @@ def write_system_document(
         companies = rows_for(company_rows, cid)
         war_parts = rows_for(war_participant_rows, cid)
         country_wars = [war for war in war_rows if str(cid) in str(war.get("major_country_ids", "")).split(";")]
+        plays = [row for row in diplomatic_play_rows if str(tag) in str(row.get("involved_tags", "")).split(";") or row.get("initiator_tag") == tag or row.get("target_tag") == tag]
+        war_costs = rows_for(war_cost_rows, cid)
+        goals = [row for row in war_goal_rows if row.get("holder_tag") == tag or row.get("creator_tag") == tag or row.get("target_country_tag") == tag]
+        formations = rows_for(military_formation_rows, cid)
+        battles = [row for row in battle_rows if row.get("attacker_tag") == tag or row.get("defender_tag") == tag]
+        casualties = rows_for(battle_casualty_rows, cid)
         pop = pop_by_id.get(cid)
         tech = tech_by_id.get(cid, {})
         infra_stressed = [s for s in states if (s.get("infrastructure_usage") or 0) > (s.get("infrastructure") or 0)]
@@ -1373,7 +1632,7 @@ def write_system_document(
                 "",
                 "#### 领土与基础设施",
                 "",
-                f"- 州数量：{len(states)}；已整合州：{len(incorporated)}；基建超载州：{len(infra_stressed)}",
+                f"- 州数量：{len(states)}；已整合州：{len(incorporated)}；基建超载州：{len(infra_stressed)}；平均破坏度：{sol_text(sum((s.get('devastation') or 0) for s in states) / len(states)) if states else 'NA'}",
             ]
         )
         state_preview = [
@@ -1383,11 +1642,12 @@ def write_system_document(
                 "used": fmt(row.get("infrastructure_usage"), 1),
                 "inc": pct(row.get("incorporation")),
                 "arable": fmt(row.get("arable_land"), 0),
+                "dev": sol_text(row.get("devastation")),
             }
             for row in sorted(states, key=lambda s: (s.get("infrastructure_usage") or 0) - (s.get("infrastructure") or 0), reverse=True)[:8]
         ]
         if state_preview:
-            lines.extend(md_table(state_preview, [("州/地区", "state"), ("基建", "infra"), ("使用", "used"), ("整合", "inc"), ("耕地", "arable")]))
+            lines.extend(md_table(state_preview, [("州/地区", "state"), ("基建", "infra"), ("使用", "used"), ("整合", "inc"), ("耕地", "arable"), ("破坏度", "dev")]))
         lines.extend(["", "#### 经济与建筑体系", ""])
         lines.append(f"- 建筑类型数：{len(buildings)}；建筑实例数：{country.get('building_entries')}")
         if categories:
@@ -1435,12 +1695,31 @@ def write_system_document(
             lines.extend(["", "主要条约/外交行动："])
             lines.extend(md_table([{"p": r["partner_tag"], "action": nice_token(r["action"]), "start": r["start_date"], "liberty": sol_text(r["liberty_desire"])} for r in pacts[:10]], [("对象", "p"), ("类型", "action"), ("开始", "start"), ("自由欲", "liberty")]))
         lines.extend(["", "#### 战争与历史战争", ""])
-        lines.append(f"- 相关战争记录：{len(country_wars)}；参战方记录：{len(war_parts)}")
+        lines.append(f"- 相关战争记录：{len(country_wars)}；参战方记录：{len(war_parts)}；外交博弈：{len(plays)}；战争目标：{len(goals)}；战斗记录：{len(battles)}")
         if country_wars:
             lines.extend(md_table([{"id": w["war_id"], "status": w["status"], "start": w["start_date"], "peace": w["peace_date"], "majors": w["major_tags"], "parts": w["participant_tags"]} for w in country_wars[:10]], [("战争ID", "id"), ("状态", "status"), ("开始", "start"), ("结束", "peace"), ("主要国家", "majors"), ("参战方", "parts")]))
+        if plays:
+            lines.extend(["", "外交博弈/阵营："])
+            lines.extend(md_table([{"id": p["diplomatic_play"], "type": nice_token(p["type"]), "region": nice_token(p["strategic_region"]), "init": p["initiator_side_tags"], "target": p["target_side_tags"], "war": p["war"]} for p in plays[:8]], [("博弈ID", "id"), ("类型", "type"), ("区域", "region"), ("进攻方阵营", "init"), ("目标方阵营", "target"), ("战争ID", "war")]))
+        if goals:
+            lines.extend(["", "战争目标："])
+            lines.extend(md_table([{"type": nice_token(g["type"]), "holder": g["holder_tag"], "target": g["target_country_tag"], "region": nice_token(g["target_region"]), "status": g["status"]} for g in goals[:10]], [("目标", "type"), ("提出方", "holder"), ("目标国", "target"), ("区域", "region"), ("状态", "status")]))
+        if formations:
+            lines.extend(["", "军队/海军编成："])
+            lines.extend(md_table([{"id": f["formation_id"], "type": f["type"], "org": sol_text(f["organization"]), "supply": sol_text(f["supply"]), "delivered": sol_text(f["delivered_supply"]), "units": nice_token(f["default_unit_types"]), "mob": f["mobilization_option_count"]} for f in formations[:10]], [("编成ID", "id"), ("类型", "type"), ("组织", "org"), ("补给", "supply"), ("已送补给", "delivered"), ("单位类型", "units"), ("动员选项", "mob")]))
         if war_parts:
             lines.extend(["", "战争支持度/消耗："])
             lines.extend(md_table([{"id": w["war_id"], "support": sol_text(w["war_support"]), "battle": sol_text(w["battles_war_support_delta"]), "exh": sol_text(w["exhaustion_war_support_delta"])} for w in war_parts[:10]], [("战争ID", "id"), ("战争支持", "support"), ("战斗影响", "battle"), ("消耗影响", "exh")]))
+        if war_costs:
+            lines.extend(["", "财政与军需成本："])
+            lines.extend(md_table([{"id": c["diplomatic_play"], "side": c["side"], "mat": fmt(c["materiel_cost_of_war"], 1), "wage": fmt(c["wage_cost_of_war"], 1), "total": fmt(c["total_known_war_cost"], 1)} for c in war_costs[:10]], [("博弈ID", "id"), ("阵营", "side"), ("军需成本", "mat"), ("工资成本", "wage"), ("合计", "total")]))
+        if battles:
+            lines.extend(["", "主要战斗："])
+            lines.extend(md_table([{"id": b["battle_id"], "where": nice_token(b["state_region"]), "status": b["status"], "start": b["start_date"], "a": b["attacker_tag"], "d": b["defender_tag"], "dead": fmt((b.get("attacker_dead") or 0) + (b.get("defender_dead") or 0), 0)} for b in battles[:10]], [("战斗ID", "id"), ("地点", "where"), ("结果", "status"), ("开始", "start"), ("进攻", "a"), ("防守", "d"), ("死亡", "dead")]))
+        if casualties:
+            total_dead = sum(row.get("dead") or 0 for row in casualties)
+            total_wounded = sum(row.get("wounded") or 0 for row in casualties)
+            lines.append(f"- 累计可读伤亡：死亡 {fmt(total_dead, 0)}；受伤 {fmt(total_wounded, 0)}。")
         lines.extend(["", "#### 社会学解读", ""])
         for note in social_reading(country, pop, cultures, types, igs):
             lines.append(f"- {note}")
@@ -1448,30 +1727,45 @@ def write_system_document(
     out.write_text("\n".join(lines), encoding="utf-8")
 
 
-def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool = True) -> tuple[Path, dict[str, Path]]:
+def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool = True, progress=None) -> tuple[Path, dict[str, Path]]:
+    def mark(percent: int, label: str) -> None:
+        if progress:
+            progress(percent, label)
+
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = f"{path.stem}_{stamp}_systems"
+    mark(5, "读取存档元数据")
     meta_info = meta(txt)
     countries = parse_countries(txt)
     player_id = player_country_id(txt, countries, str(meta_info["country"]))
     rankings = parse_rankings(txt, countries)
     major_ids = select_major_country_ids(countries, rankings, player_id, limit)
     major_set = set(major_ids)
+    mark(12, "整理主要国家")
     all_states, state_to_country = parse_all_states(txt, countries)
     major_states = [row for row in all_states if row["country_id"] in major_set]
+    mark(20, "整理州、基建、破坏度")
     building_details, building_summary = parse_buildings_for_countries(txt, state_to_country, countries, major_set)
+    mark(30, "整理建筑和经济部门")
     culture_map = parse_culture_map(txt) if full_pops else {}
     pop_summary, pop_by_type, pop_by_culture, pop_by_religion = (
         parse_pops_for_countries(txt, state_to_country, countries, major_set, culture_map) if full_pops else ([], [], [], [])
     )
+    mark(58, "整理人口、职业、文化、宗教")
     law_rows = parse_laws_for_countries(txt, countries, major_set)
     ig_rows = parse_interest_groups_for_countries(txt, countries, major_set)
     tech_rows = parse_technology_for_countries(txt, countries, major_set)
+    mark(68, "整理制度、利益集团、科技")
     relation_rows = parse_relations_for_countries(txt, countries, major_set)
     pact_rows = parse_pacts_for_countries(txt, countries, major_set)
     company_rows = parse_companies_for_countries(txt, countries, major_set)
     war_rows, war_participant_rows = parse_wars_for_countries(txt, countries, major_set)
+    diplomatic_play_rows, war_cost_rows = parse_diplomatic_plays_for_countries(txt, countries, major_set)
+    war_goal_rows = parse_war_goals_for_countries(txt, countries, major_set)
+    military_formation_rows = parse_military_formations_for_countries(txt, countries, major_set)
+    battle_rows, battle_casualty_rows = parse_battles_for_countries(txt, countries, major_set, culture_map)
+    mark(82, "整理外交、战争、战斗、军队")
 
     rank_by_country = {row["country_id"]: row for row in rankings}
     world_gdp = sum(row.get("gdp") or 0 for row in countries.values())
@@ -1541,9 +1835,16 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         "pacts": REPORT_DIR / f"{stem}_pacts.csv",
         "wars": REPORT_DIR / f"{stem}_wars.csv",
         "war_participants": REPORT_DIR / f"{stem}_war_participants.csv",
+        "diplomatic_plays": REPORT_DIR / f"{stem}_diplomatic_plays.csv",
+        "war_costs": REPORT_DIR / f"{stem}_war_costs.csv",
+        "war_goals": REPORT_DIR / f"{stem}_war_goals.csv",
+        "military_formations": REPORT_DIR / f"{stem}_military_formations.csv",
+        "battles": REPORT_DIR / f"{stem}_battles.csv",
+        "battle_casualties": REPORT_DIR / f"{stem}_battle_casualties.csv",
     }
     write_csv(outputs["major_countries"], countries_rows, ["selection_order", "country_id", "tag", "power_rank", "prestige_rank", "gdp", "world_gdp_share", "major_gdp_share", "gdp_start", "gdp_change", "gdp_change_pct", "population", "gdp_per_capita", "prestige", "prestige_start", "prestige_change", "prestige_change_pct", "literacy", "literacy_start", "literacy_change", "literacy_change_pct", "sol", "sol_start", "sol_change", "sol_change_pct", "government", "market", "capital", "legitimacy", "infamy", "states", "building_entries", "pop_entries", "loyalists", "radicals", "unanchored"])
-    write_csv(outputs["states"], major_states, ["country_id", "tag", "state_id", "region", "capital", "arable_land", "incorporation", "infrastructure", "infrastructure_usage", "bureaucracy_cost", "previous_country", "last_owner_change"])
+    mark(88, "写出 CSV 表格")
+    write_csv(outputs["states"], major_states, ["country_id", "tag", "state_id", "region", "capital", "arable_land", "incorporation", "infrastructure", "infrastructure_usage", "trade_capacity", "trade_capacity_usage", "devastation", "bureaucracy_cost", "previous_country", "last_owner_change"])
     write_csv(outputs["building_summary"], building_summary, ["country_id", "tag", "building", "sector", "building_count", "levels", "staffing", "goods_sales", "goods_cost", "profit_after_reserves"])
     write_csv(outputs["building_details"], building_details, ["country_id", "tag", "state_id", "building_id", "building", "levels", "staffing", "throughput", "salary_rate", "goods_sales", "goods_cost", "profit_after_reserves", "cash_reserves", "active"])
     write_csv(outputs["companies"], company_rows, ["company_id", "country_id", "tag", "company_type", "building_id", "state_region", "prosperity", "ceo", "productivity_start", "productivity_latest", "productivity_change", "productivity_change_pct", "productivity_samples"])
@@ -1558,6 +1859,12 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
     write_csv(outputs["pacts"], pact_rows, ["pact_id", "country_id", "tag", "partner_id", "partner_tag", "side", "action", "start_date", "forced_duration", "liberty_desire"])
     write_csv(outputs["wars"], war_rows, ["war_id", "status", "diplomatic_play", "start_date", "peace_date", "days_since_exhaustion", "participant_country_ids", "participant_tags", "major_country_ids", "major_tags", "attacker_peace_country", "defender_peace_country", "attacker_last_proposal_date", "defender_last_proposal_date"])
     write_csv(outputs["war_participants"], war_participant_rows, ["war_id", "country_id", "tag", "diplomatic_play", "war_support", "initial_war_support", "battles_war_support_delta", "exhaustion_war_support_delta", "situations_war_support_delta", "violator"])
+    write_csv(outputs["diplomatic_plays"], diplomatic_play_rows, ["diplomatic_play", "type", "state", "strategic_region", "initiator_id", "initiator_tag", "target_id", "target_tag", "initiator_side_tags", "target_side_tags", "involved_tags", "war", "escalation", "start_date", "end_date"])
+    write_csv(outputs["war_costs"], war_cost_rows, ["diplomatic_play", "country_id", "tag", "side", "materiel_cost_of_war", "wage_cost_of_war", "total_known_war_cost"])
+    write_csv(outputs["war_goals"], war_goal_rows, ["war_goal_id", "type", "holder_id", "holder_tag", "creator_id", "creator_tag", "target_country_id", "target_country_tag", "target_state", "target_region", "target_other", "diplomatic_play", "demand_type", "status", "initial_war_goal"])
+    write_csv(outputs["military_formations"], military_formation_rows, ["formation_id", "country_id", "tag", "type", "ordinal_number", "home_hq", "supply_hub", "organization", "supply", "delivered_supply", "supply_priority", "flags", "default_unit_types", "unit_type_count", "mobilization_options", "mobilization_option_count", "current_location_type", "current_location_id", "target_location_type", "target_location_id", "creation_date", "ai_tag"])
+    write_csv(outputs["battles"], battle_rows, ["battle_id", "war_id", "front", "type", "state_region", "province", "attacker_country_id", "attacker_tag", "defender_country_id", "defender_tag", "status", "start_date", "end_date", "attacker_start_battalions", "defender_start_battalions", "attacker_starting_manpower", "defender_starting_manpower", "attacker_ending_manpower", "defender_ending_manpower", "attacker_dead", "attacker_wounded", "defender_dead", "defender_wounded", "num_captured_provinces", "capturing_country", "lost_provinces_country"])
+    write_csv(outputs["battle_casualties"], battle_casualty_rows, ["battle_id", "war_id", "side", "country_id", "tag", "culture", "raw_culture", "dead", "wounded", "demoralized"])
 
     summary = {
         "save": str(path),
@@ -1584,6 +1891,12 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
             "pacts": len(pact_rows),
             "wars": len(war_rows),
             "war_participants": len(war_participant_rows),
+            "diplomatic_plays": len(diplomatic_play_rows),
+            "war_costs": len(war_cost_rows),
+            "war_goals": len(war_goal_rows),
+            "military_formations": len(military_formation_rows),
+            "battles": len(battle_rows),
+            "battle_casualties": len(battle_casualty_rows),
         },
         "outputs": {key: str(value) for key, value in outputs.items()},
     }
@@ -1620,6 +1933,12 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         "pacts": "外交条约/附庸/竞争/行动",
         "wars": "战争/历史战争总表",
         "war_participants": "主要国家参战方、战争支持度和消耗",
+        "diplomatic_plays": "外交博弈：战争双方阵营、升级、区域",
+        "war_costs": "战争财政和军需成本",
+        "war_goals": "战争目标",
+        "military_formations": "军队/海军编成、军种、动员选项、补给",
+        "battles": "战斗记录：地点、日期、胜负、兵力、伤亡",
+        "battle_casualties": "战斗伤亡：按国家和文化拆分",
         "systems_summary": "机器可读总索引 JSON",
     }
     for key, label in labels.items():
@@ -1641,6 +1960,7 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
     lines.extend(md_table(preview, [("序", "order"), ("国家", "tag"), ("等级", "rank"), ("GDP", "gdp"), ("人口", "pop"), ("生活水平", "sol"), ("威望", "prestige")]))
     lines.extend(["", "## 说明", "", "- 这些 CSV 的列名固定；换存档后内容会变，但表结构保持不变。", "- 国际关系和条约按双方拆成双向行，便于按任意国家过滤。", "- 文化名来自存档内 cultures 数据库；无法识别时保留原始值。"])
     outputs["systems_report"].write_text("\n".join(lines), encoding="utf-8")
+    mark(95, "写出体系化文档")
     write_system_document(
         path,
         outputs["systems_document"],
@@ -1660,7 +1980,14 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         company_rows,
         war_rows,
         war_participant_rows,
+        diplomatic_play_rows,
+        war_cost_rows,
+        war_goal_rows,
+        military_formation_rows,
+        battle_rows,
+        battle_casualty_rows,
     )
+    mark(100, "导出完成")
     return outputs["systems_document"], outputs
 
 
