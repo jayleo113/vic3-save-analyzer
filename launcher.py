@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,21 +53,93 @@ DESKTOP_REPORT_ROOT = Path.home() / "Desktop" / "Victoria3存档报告"
 
 
 class ProgressPrinter:
-    def __init__(self) -> None:
-        self.started = time.time()
-        self.last_percent = -1
+    HEARTBEAT_SUFFIX = "，仍在处理"
 
-    def __call__(self, percent: int, label: str) -> None:
-        percent = max(0, min(100, int(percent)))
-        elapsed = max(time.time() - self.started, 0.1)
-        if percent > 0:
-            remaining = max((elapsed / percent) * (100 - percent), 0)
-            eta = f"{int(remaining // 60):02d}:{int(remaining % 60):02d}"
+    def __init__(self, total_hint_seconds: int = 180) -> None:
+        self.started = time.time()
+        self.total_hint_seconds = total_hint_seconds
+        self.percent = 0
+        self.label = "准备"
+        self.last_percent = -1
+        self.last_label = ""
+        self.last_print = 0.0
+        self.done = False
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.done = False
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        with self.lock:
+            self.done = True
+        if self.thread:
+            self.thread.join(timeout=0.3)
+
+    def _heartbeat(self) -> None:
+        while True:
+            time.sleep(8)
+            with self.lock:
+                if self.done:
+                    return
+                percent = self.percent
+                label = self.label
+            while label.endswith(self.HEARTBEAT_SUFFIX):
+                label = label[: -len(self.HEARTBEAT_SUFFIX)]
+            self(percent, f"{label}{self.HEARTBEAT_SUFFIX}", force=True, remember=False)
+
+    @staticmethod
+    def _clock(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    @staticmethod
+    def _bar(percent: int) -> str:
+        width = 22
+        filled = int(width * percent / 100)
+        return "#" * filled + "-" * (width - filled)
+
+    def _eta(self, percent: int, elapsed: float) -> str:
+        if percent >= 100:
+            return "00:00"
+        if percent <= 3:
+            return "计算中"
+        progress_total = elapsed / max(percent / 100, 0.01)
+        if elapsed < 20 and percent < 35:
+            estimated_total = max(progress_total, self.total_hint_seconds)
         else:
-            eta = "--:--"
-        if percent != self.last_percent:
-            print(f"[{percent:3d}%] {label}，预计剩余 {eta}")
+            estimated_total = max(progress_total, elapsed + 5)
+        remaining = max(estimated_total - elapsed, 0)
+        if percent < 95 and remaining < 10:
+            return "00:10内"
+        return self._clock(remaining)
+
+    def __call__(self, percent: int, label: str, force: bool = False, remember: bool = True) -> None:
+        percent = max(0, min(100, int(percent)))
+        now = time.time()
+        with self.lock:
+            self.percent = max(self.percent, percent)
+            if remember:
+                self.label = label
+            percent = self.percent
+            elapsed = max(now - self.started, 0.1)
+            should_print = (
+                force
+                or percent != self.last_percent
+                or label != self.last_label
+                or now - self.last_print >= 6
+            )
+            if not should_print:
+                return
             self.last_percent = percent
+            self.last_label = label
+            self.last_print = now
+        print(
+            f"[{self._bar(percent)}] {percent:3d}%  {label} | "
+            f"已用 {self._clock(elapsed)} | 剩余约 {self._eta(percent, elapsed)}"
+        )
 
 
 def clear() -> None:
@@ -258,17 +331,32 @@ def run_combined_export() -> None:
     if not path:
         print("没有找到 Victoria 3 存档。")
         return
-    progress = ProgressPrinter()
-    progress(1, "找到最新存档")
-    run_dir = prepare_desktop_output(path)
-    progress(3, "创建桌面分类目录")
-    txt = analyze.read_save(path)
-    progress(18, "存档读取完成")
-    quick_report, quick_outputs = analyze.build_report(path, txt, full_pops=False)
-    progress(28, "快速报告完成")
-    document, outputs = analyze.build_system_export(path, txt, limit=30, full_pops=True, progress=lambda p, label: progress(28 + int(p * 0.68), label))
-    categorize_run_outputs(run_dir, quick_report, quick_outputs, outputs)
-    progress(100, "分类复制完成")
+    progress = ProgressPrinter(total_hint_seconds=240)
+    progress.start()
+    try:
+        progress(1, "找到最新存档")
+        run_dir = prepare_desktop_output(path)
+        progress(3, "创建桌面分类目录")
+        progress(5, "读取并展开存档")
+        txt = analyze.read_save(path)
+        progress(18, "存档读取完成")
+        quick_report, quick_outputs = analyze.build_report(path, txt, full_pops=False)
+        progress(28, "快速报告完成")
+        document, outputs = analyze.build_system_export(
+            path,
+            txt,
+            limit=30,
+            full_pops=True,
+            progress=lambda p, label: progress(28 + int(p * 0.68), label),
+        )
+        progress(97, "复制到桌面分类目录")
+        categorize_run_outputs(run_dir, quick_report, quick_outputs, outputs)
+        progress(100, "分类复制完成")
+    except Exception as exc:
+        progress.stop()
+        print(f"\n导出失败：{exc}")
+        return
+    progress.stop()
     print("\n一键导出完成。")
     print(f"桌面分类目录：{run_dir}")
     print(f"快速报告：{quick_report}")
@@ -384,20 +472,39 @@ def run_api_analysis(config: dict) -> None:
     if not path:
         print("没有找到 Victoria 3 存档。")
         return
-    progress = ProgressPrinter()
-    progress(1, "找到最新存档")
-    run_dir = prepare_desktop_output(path)
-    progress(3, "创建桌面分类目录")
-    txt = analyze.read_save(path)
-    progress(18, "存档读取完成")
-    document, outputs = analyze.build_system_export(path, txt, limit=30, full_pops=True, progress=lambda p, label: progress(18 + int(p * 0.55), label))
-    categorize_run_outputs(run_dir, None, {}, outputs)
-    progress(75, "本地体系数据已分类")
+    progress = ProgressPrinter(total_hint_seconds=300)
+    progress.start()
+    try:
+        progress(1, "找到最新存档")
+        run_dir = prepare_desktop_output(path)
+        progress(3, "创建桌面分类目录")
+        progress(5, "读取并展开存档")
+        txt = analyze.read_save(path)
+        progress(18, "存档读取完成")
+        document, outputs = analyze.build_system_export(
+            path,
+            txt,
+            limit=30,
+            full_pops=True,
+            progress=lambda p, label: progress(18 + int(p * 0.55), label),
+        )
+        progress(73, "复制到桌面分类目录")
+        categorize_run_outputs(run_dir, None, {}, outputs)
+        progress(75, "本地体系数据已分类")
+    except Exception as exc:
+        progress.stop()
+        print(f"\n本地体系数据生成失败：{exc}")
+        return
+    progress.stop()
     print("正在调用 API 生成分类报表...")
     api_content = compact_system_bundle_for_api(document, outputs)
+    api_progress = ProgressPrinter(total_hint_seconds=90)
+    api_progress.start()
+    api_progress(80, "等待 API 生成深度报表")
     try:
         answer = call_chat_api(config, api_content)
     except Exception as exc:
+        api_progress.stop()
         print(f"API 分析失败：{exc}")
         print(f"本地体系文档仍可查看：{document}")
         return
@@ -405,7 +512,8 @@ def run_api_analysis(config: dict) -> None:
     out = document.with_name(document.stem + "_api_tables.md")
     out.write_text("# API 深挖分类报表\n\n" + answer + "\n", encoding="utf-8")
     copy_to_category(out, run_dir / "01_总览文档")
-    progress(100, "API 报表完成")
+    api_progress(100, "API 报表完成")
+    api_progress.stop()
     print("\nAPI 报表完成。")
     print(f"桌面分类目录：{run_dir}")
     print(f"API报表：{out}")

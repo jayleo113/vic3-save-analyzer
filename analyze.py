@@ -691,7 +691,14 @@ def parse_buildings(txt: str, state_ids: set[int]) -> list[dict]:
     return rows
 
 
-def parse_pops_for_countries(txt: str, state_to_country: dict[int, int], countries: dict[int, dict], country_ids: set[int], culture_map: dict[str, str]) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+def parse_pops_for_countries(
+    txt: str,
+    state_to_country: dict[int, int],
+    countries: dict[int, dict],
+    country_ids: set[int],
+    culture_map: dict[str, str],
+    progress=None,
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     db = database_block(txt, "pops")
     if not db:
         return [], [], [], []
@@ -702,7 +709,14 @@ def parse_pops_for_countries(txt: str, state_to_country: dict[int, int], countri
     by_religion: dict[tuple[int, str], dict] = {}
 
     entries = list(re.finditer(r"(?m)^(\d+)=(\{|none)", db))
+    total_entries = max(len(entries), 1)
+    last_bucket = -1
     for index, match in enumerate(entries):
+        if progress and (index % 5000 == 0 or index + 1 == len(entries)):
+            bucket = int((index + 1) * 100 / total_entries)
+            if bucket != last_bucket:
+                progress(bucket, f"扫描人口条目 {index + 1:,}/{len(entries):,}")
+                last_bucket = bucket
         if match.group(2) == "none":
             continue
         end = entries[index + 1].start() if index + 1 < len(entries) else len(db)
@@ -780,6 +794,9 @@ def parse_pops_for_countries(txt: str, state_to_country: dict[int, int], countri
             item["dependents"] += dependents
             item["loyalists"] += loyalists
             item["radicals"] += radicals
+
+    if progress:
+        progress(100, f"人口扫描完成，可读人口组 {sum(row['pop_entries'] for row in summaries.values()):,}")
 
     for store in (by_type, by_culture, by_religion):
         for item in store.values():
@@ -1336,13 +1353,27 @@ def battle_side_stats(side_block: str | None) -> dict[str, object]:
     }
 
 
-def parse_battles_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int], culture_map: dict[str, str]) -> tuple[list[dict], list[dict]]:
+def parse_battles_for_countries(
+    txt: str,
+    countries: dict[int, dict],
+    country_ids: set[int],
+    culture_map: dict[str, str],
+    progress=None,
+) -> tuple[list[dict], list[dict]]:
     db = database_block(txt, "battle_manager")
     if not db:
         return [], []
     battle_rows = []
     casualty_rows = []
-    for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
+    entries = [(key, open_pos, close) for key, open_pos, close in iter_top_blocks(db, 0, len(db)) if key.isdigit()]
+    total_entries = max(len(entries), 1)
+    last_bucket = -1
+    for index, (key, open_pos, close) in enumerate(entries):
+        if progress and (index % 250 == 0 or index + 1 == len(entries)):
+            bucket = int((index + 1) * 100 / total_entries)
+            if bucket != last_bucket:
+                progress(bucket, f"扫描战斗条目 {index + 1:,}/{len(entries):,}")
+                last_bucket = bucket
         if not key.isdigit():
             continue
         block = db[open_pos + 1 : close]
@@ -1406,6 +1437,8 @@ def parse_battles_for_countries(txt: str, countries: dict[int, dict], country_id
                         "demoralized": int(num(top_value(item, "num_demoralized")) or 0),
                     }
                 )
+    if progress:
+        progress(100, f"战斗扫描完成，可读战斗 {len(battle_rows):,}")
     return (
         sorted(battle_rows, key=lambda row: (row["war_id"], row["start_date"], row["battle_id"])),
         sorted(casualty_rows, key=lambda row: (row["tag"], row["war_id"], row["battle_id"], row["side"])),
@@ -1749,22 +1782,41 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
     building_details, building_summary = parse_buildings_for_countries(txt, state_to_country, countries, major_set)
     mark(30, "整理建筑和经济部门")
     culture_map = parse_culture_map(txt) if full_pops else {}
-    pop_summary, pop_by_type, pop_by_culture, pop_by_religion = (
-        parse_pops_for_countries(txt, state_to_country, countries, major_set, culture_map) if full_pops else ([], [], [], [])
-    )
+    if full_pops:
+        pop_summary, pop_by_type, pop_by_culture, pop_by_religion = parse_pops_for_countries(
+            txt,
+            state_to_country,
+            countries,
+            major_set,
+            culture_map,
+            progress=lambda p, label: mark(30 + int(p * 0.28), label),
+        )
+    else:
+        pop_summary, pop_by_type, pop_by_culture, pop_by_religion = [], [], [], []
     mark(58, "整理人口、职业、文化、宗教")
     law_rows = parse_laws_for_countries(txt, countries, major_set)
     ig_rows = parse_interest_groups_for_countries(txt, countries, major_set)
     tech_rows = parse_technology_for_countries(txt, countries, major_set)
     mark(68, "整理制度、利益集团、科技")
     relation_rows = parse_relations_for_countries(txt, countries, major_set)
+    mark(70, "整理外交关系")
     pact_rows = parse_pacts_for_countries(txt, countries, major_set)
+    mark(72, "整理外交条约")
     company_rows = parse_companies_for_countries(txt, countries, major_set)
+    mark(74, "整理公司和GDP占比")
     war_rows, war_participant_rows = parse_wars_for_countries(txt, countries, major_set)
+    mark(76, "整理战争与参战方")
     diplomatic_play_rows, war_cost_rows = parse_diplomatic_plays_for_countries(txt, countries, major_set)
     war_goal_rows = parse_war_goals_for_countries(txt, countries, major_set)
     military_formation_rows = parse_military_formations_for_countries(txt, countries, major_set)
-    battle_rows, battle_casualty_rows = parse_battles_for_countries(txt, countries, major_set, culture_map)
+    mark(79, "整理外交博弈、战争目标、军队")
+    battle_rows, battle_casualty_rows = parse_battles_for_countries(
+        txt,
+        countries,
+        major_set,
+        culture_map,
+        progress=lambda p, label: mark(79 + int(p * 0.03), label),
+    )
     mark(82, "整理外交、战争、战斗、军队")
 
     rank_by_country = {row["country_id"]: row for row in rankings}
