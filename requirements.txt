@@ -1,0 +1,2 @@
+# No required third-party Python packages.
+# Optional binary-save support can use Garibaldi/Rakaly via scripts/install_community_tools.ps1.

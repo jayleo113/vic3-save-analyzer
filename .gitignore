@@ -1,0 +1,33 @@
+# Local generated output
+reports/
+*.melted.txt
+*.log
+
+# Save files can contain personal gameplay data and can be huge
+*.v3
+*.v3.bak
+save games/
+
+# Local configuration and secrets
+api_config.json
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Bundled third-party clones and local backups
+community/
+往期版本/
+*.codex_backup
+启动F盘维多利亚3存档读取器.bat
+
+# Windows clutter
+Thumbs.db
+Desktop.ini
