@@ -13,6 +13,7 @@ Use this project-local skill when the user asks to read, parse, export, compare,
 - Advanced/dev copy: optional local copy under the user's Desktop.
 - User-facing output: `%USERPROFILE%\Desktop\Victoria3存档报告\<country>_<game-date>\`
 - Exported files must be prefixed with the save's in-game country and in-game date, for example `SWI_1858-08-04_systems_wars.csv`.
+- System exports should include market tables, political movements, formal treaties, and treaty articles alongside the existing economy, population, diplomacy, and war tables.
 - API config: `%USERPROFILE%\.vic3-save-analyzer\api_config.json`
 
 ## Main User Intent
@@ -41,18 +42,26 @@ Avoid defaulting to "what should I do next". Only give strategy advice when the 
 The launcher menu should stay simple:
 
 ```text
-[1] 一键导出：快速报告 + 体系化文档
-[2] API 深度报表
+[1] 选择存档导出
+[2] 直接导出最新存档
+[3] API 深度报表
 [0] 退出
 ```
 
 One-click export should:
 
-1. Read the latest `.v3` save from the Victoria 3 save directory.
+1. Let the user choose a scanned save by in-game country/date, or directly export the latest `.v3` save.
 2. Generate a fast local report.
 3. Generate a full systematic country document.
 4. Export fixed CSV/JSON tables.
 5. Copy outputs into categorized desktop folders.
+
+Terminal progress should stay compact and human-readable:
+
+- Keep one dynamic status line during export.
+- Show percentage, current step number, total steps, and concrete scanned/remaining item counts when available.
+- Do not show estimated remaining time unless there is a reliable phase-specific model.
+- Do not use decorative progress bars that risk wrapping in Windows Terminal.
 
 API deep report should:
 
@@ -66,12 +75,14 @@ API deep report should:
 When launched from the UI, copy reports into:
 
 ```text
-01_总览文档
-02_快速报告
-03_经济公司
-04_人口社会
-05_制度外交科技战争
-06_机器数据
+01_总览索引
+02_国家总表
+03_经济市场公司
+04_人口社会政治
+05_制度科技
+06_外交条约战争
+07_快速报告
+08_机器数据
 ```
 
 Important fixed outputs:
@@ -83,15 +94,22 @@ Important fixed outputs:
 - `*_systems_building_summary.csv`
 - `*_systems_building_details.csv`
 - `*_systems_companies.csv`
+- `*_systems_markets.csv`
+- `*_systems_market_members.csv`
+- `*_systems_market_states.csv`
+- `*_systems_market_trade_goods.csv`
 - `*_systems_population_summary.csv`
 - `*_systems_population_by_type.csv`
 - `*_systems_population_by_culture.csv`
 - `*_systems_population_by_religion.csv`
 - `*_systems_laws.csv`
 - `*_systems_interest_groups.csv`
+- `*_systems_political_movements.csv`
 - `*_systems_technology.csv`
 - `*_systems_relations.csv`
 - `*_systems_pacts.csv`
+- `*_systems_treaties.csv`
+- `*_systems_treaty_articles.csv`
 - `*_systems_wars.csv`
 - `*_systems_war_participants.csv`
 - `*_systems_diplomatic_plays.csv`

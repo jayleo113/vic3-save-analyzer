@@ -59,6 +59,18 @@ COMMUNITY_SOURCES = [
 ]
 
 
+_DATABASE_BLOCK_CACHE: dict[tuple[int, str], tuple[str, str | None]] = {}
+
+
+def clear_database_block_cache(txt: str | None = None) -> None:
+    if txt is None:
+        _DATABASE_BLOCK_CACHE.clear()
+        return
+    txt_id = id(txt)
+    for key in [key for key in _DATABASE_BLOCK_CACHE if key[0] == txt_id]:
+        del _DATABASE_BLOCK_CACHE[key]
+
+
 LAW_NAMES = {
     "law_presidential_republic": "总统共和制",
     "law_parliamentary_republic": "议会共和制",
@@ -161,7 +173,9 @@ def top_level_block(txt: str, key: str) -> tuple[str, int, int] | None:
     return txt[open_pos + 1 : close], open_pos, close
 
 
-def subblock(block: str, key: str) -> str | None:
+def subblock(block: str | None, key: str) -> str | None:
+    if not block:
+        return None
     match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*\{{", block)
     if not match:
         return None
@@ -175,6 +189,19 @@ def top_value(block: str | None, key: str) -> str | None:
         return None
     match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*([^\n{{}}]+)", block)
     return match.group(1).strip().strip('"') if match else None
+
+
+def top_values(block: str | None, keys: set[str]) -> dict[str, str]:
+    if not block:
+        return {}
+    values = {}
+    for match in re.finditer(r"(?m)^\s*([A-Za-z0-9_\-]+)\s*=\s*([^\n{}]+)", block):
+        key = match.group(1)
+        if key in keys and key not in values:
+            values[key] = match.group(2).strip().strip('"')
+            if len(values) == len(keys):
+                break
+    return values
 
 
 def list_value(block: str | None, key: str) -> list[str]:
@@ -208,6 +235,16 @@ def iter_top_blocks(txt: str, start: int, end: int):
             pos = value_pos
 
 
+def iter_numbered_entries(db: str):
+    entries = list(re.finditer(r"(?m)^(\d+)=(\{|none)", db))
+    for index, match in enumerate(entries):
+        key = match.group(1)
+        if match.group(2) == "none":
+            continue
+        end = entries[index + 1].start() if index + 1 < len(entries) else len(db)
+        yield key, db[match.end() : end]
+
+
 def iter_anonymous_blocks(txt: str):
     pos = 0
     while pos < len(txt):
@@ -220,18 +257,27 @@ def iter_anonymous_blocks(txt: str):
 
 
 def database_block(txt: str, manager: str) -> str | None:
+    cache_key = (id(txt), manager)
+    cached = _DATABASE_BLOCK_CACHE.get(cache_key)
+    if cached and cached[0] is txt:
+        return cached[1]
+
     manager_block = top_level_block(txt, manager)
     if not manager_block:
         manager_block = block_after(txt, manager + "={")
     if not manager_block:
+        _DATABASE_BLOCK_CACHE[cache_key] = (txt, None)
         return None
     block = manager_block[0]
     db_pos = block.find("database=")
     if db_pos < 0:
+        _DATABASE_BLOCK_CACHE[cache_key] = (txt, block)
         return block
     open_pos = block.find("{", db_pos)
     close = brace_span(block, open_pos)
-    return block[open_pos + 1 : close]
+    result = block[open_pos + 1 : close]
+    _DATABASE_BLOCK_CACHE[cache_key] = (txt, result)
+    return result
 
 
 def last_trend_values(block: str | None) -> list[float]:
@@ -573,40 +619,78 @@ def select_major_country_ids(countries: dict[int, dict], rankings: list[dict], p
     return selected
 
 
+def parse_state_trade_goods(block: str) -> list[dict]:
+    traded_goods = list_value(block, "traded_goods")
+    trade_block = subblock(block, "trade")
+    goods_block = subblock(trade_block or "", "goods")
+    goods_items = []
+    if goods_block:
+        for good_key, good_open, good_close in iter_top_blocks(goods_block, 0, len(goods_block)):
+            item_block = goods_block[good_open + 1 : good_close]
+            goods_items.append((good_key, num(top_value(item_block, "value"))))
+    if not goods_items:
+        goods_items = [(str(index), "") for index, _ in enumerate(traded_goods)]
+    rows = []
+    for index, (good_id, trade_value) in enumerate(goods_items):
+        rows.append(
+            {
+                "goods_id": good_id,
+                "goods_name": traded_goods[index] if index < len(traded_goods) else "",
+                "trade_value": trade_value,
+            }
+        )
+    return rows
+
+
 def parse_all_states(txt: str, countries: dict[int, dict]) -> tuple[list[dict], dict[int, int]]:
     states_block = database_block(txt, "states")
     if not states_block:
         return [], {}
     states = []
     state_to_country = {}
-    for key, open_pos, close in iter_top_blocks(states_block, 0, len(states_block)):
-        if not key.isdigit():
-            continue
-        block = states_block[open_pos + 1 : close]
-        country = top_value(block, "country")
+    state_keys = {
+        "country",
+        "state_region",
+        "capital",
+        "arable_land",
+        "incorporation",
+        "infrastructure",
+        "infrastructure_usage",
+        "trade_capacity",
+        "trade_capacity_usage",
+        "devastation",
+        "base_pop_bureaucracy_cost",
+        "previous_country_definition",
+        "last_owner_change",
+    }
+    for key, block in iter_numbered_entries(states_block):
+        values = top_values(block, state_keys)
+        country = values.get("country")
         if not country or not country.isdigit():
             continue
         country_id = int(country)
         state_id = int(key)
         state_to_country[state_id] = country_id
         country_row = countries.get(country_id, {})
+        trade_goods = parse_state_trade_goods(block)
         states.append(
             {
                 "country_id": country_id,
                 "tag": country_row.get("tag", ""),
                 "state_id": state_id,
-                "region": top_value(block, "state_region") or "",
-                "capital": top_value(block, "capital") or "",
-                "arable_land": num(top_value(block, "arable_land")),
-                "incorporation": num(top_value(block, "incorporation")),
-                "infrastructure": num(top_value(block, "infrastructure")),
-                "infrastructure_usage": num(top_value(block, "infrastructure_usage")),
-                "trade_capacity": num(top_value(block, "trade_capacity")),
-                "trade_capacity_usage": num(top_value(block, "trade_capacity_usage")),
-                "devastation": num(top_value(block, "devastation")),
-                "bureaucracy_cost": num(top_value(block, "base_pop_bureaucracy_cost")),
-                "previous_country": top_value(block, "previous_country_definition") or "",
-                "last_owner_change": top_value(block, "last_owner_change") or "",
+                "region": values.get("state_region") or "",
+                "capital": values.get("capital") or "",
+                "arable_land": num(values.get("arable_land")),
+                "incorporation": num(values.get("incorporation")),
+                "infrastructure": num(values.get("infrastructure")),
+                "infrastructure_usage": num(values.get("infrastructure_usage")),
+                "trade_capacity": num(values.get("trade_capacity")),
+                "trade_capacity_usage": num(values.get("trade_capacity_usage")),
+                "devastation": num(values.get("devastation")),
+                "bureaucracy_cost": num(values.get("base_pop_bureaucracy_cost")),
+                "previous_country": values.get("previous_country_definition") or "",
+                "last_owner_change": values.get("last_owner_change") or "",
+                "_trade_goods": trade_goods,
             }
         )
     return states, state_to_country
@@ -645,11 +729,24 @@ def parse_buildings_for_countries(txt: str, state_to_country: dict[int, int], co
         return [], []
     rows = []
     aggregate: dict[tuple[int, str], dict] = {}
-    for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
-        if not key.isdigit():
-            continue
-        block = db[open_pos + 1 : close]
-        state = top_value(block, "state")
+    building_keys = {
+        "state",
+        "building",
+        "type",
+        "levels",
+        "level",
+        "staffing",
+        "goods_sales",
+        "goods_cost",
+        "profit_after_reserves",
+        "throughput",
+        "salary_rate",
+        "cash_reserves",
+        "active",
+    }
+    for key, block in iter_numbered_entries(db):
+        values = top_values(block, building_keys)
+        state = values.get("state")
         if not state or not state.isdigit():
             continue
         state_id = int(state)
@@ -657,12 +754,12 @@ def parse_buildings_for_countries(txt: str, state_to_country: dict[int, int], co
         if country_id not in country_ids:
             continue
         country_row = countries.get(country_id, {})
-        building = top_value(block, "building") or top_value(block, "type") or ""
-        levels = num(top_value(block, "levels") or top_value(block, "level") or "0") or 0
-        staffing = num(top_value(block, "staffing"))
-        goods_sales = num(top_value(block, "goods_sales"))
-        goods_cost = num(top_value(block, "goods_cost"))
-        profit = num(top_value(block, "profit_after_reserves"))
+        building = values.get("building") or values.get("type") or ""
+        levels = num(values.get("levels") or values.get("level") or "0") or 0
+        staffing = num(values.get("staffing"))
+        goods_sales = num(values.get("goods_sales"))
+        goods_cost = num(values.get("goods_cost"))
+        profit = num(values.get("profit_after_reserves"))
         row = {
             "country_id": country_id,
             "tag": country_row.get("tag", ""),
@@ -671,13 +768,13 @@ def parse_buildings_for_countries(txt: str, state_to_country: dict[int, int], co
             "building": building,
             "levels": levels,
             "staffing": staffing,
-            "throughput": num(top_value(block, "throughput")),
-            "salary_rate": num(top_value(block, "salary_rate")),
+            "throughput": num(values.get("throughput")),
+            "salary_rate": num(values.get("salary_rate")),
             "goods_sales": goods_sales,
             "goods_cost": goods_cost,
             "profit_after_reserves": profit,
-            "cash_reserves": num(top_value(block, "cash_reserves")),
-            "active": top_value(block, "active") or "",
+            "cash_reserves": num(values.get("cash_reserves")),
+            "active": values.get("active") or "",
         }
         rows.append(row)
         key2 = (country_id, building)
@@ -749,6 +846,21 @@ def parse_pops_for_countries(
     entries = list(re.finditer(r"(?m)^(\d+)=(\{|none)", db))
     total_entries = max(len(entries), 1)
     last_bucket = -1
+    pop_keys = {
+        "location",
+        "state",
+        "workforce",
+        "dependents",
+        "size",
+        "type",
+        "pop_type",
+        "culture",
+        "religion",
+        "workplace",
+        "loyalists_and_radicals",
+        "loyalists",
+        "radicals",
+    }
     for index, match in enumerate(entries):
         if progress and (index % 5000 == 0 or index + 1 == len(entries)):
             bucket = int((index + 1) * 100 / total_entries)
@@ -759,7 +871,8 @@ def parse_pops_for_countries(
             continue
         end = entries[index + 1].start() if index + 1 < len(entries) else len(db)
         block = db[match.end() : end]
-        state = top_value(block, "location") or top_value(block, "state")
+        values = top_values(block, pop_keys)
+        state = values.get("location") or values.get("state")
         if not state or not state.isdigit():
             continue
         country_id = state_to_country.get(int(state))
@@ -767,19 +880,19 @@ def parse_pops_for_countries(
             continue
 
         country_row = countries.get(country_id, {})
-        workforce = int(num(top_value(block, "workforce")) or 0)
-        dependents = int(num(top_value(block, "dependents")) or 0)
-        size = int(num(top_value(block, "size")) or workforce + dependents)
+        workforce = int(num(values.get("workforce")) or 0)
+        dependents = int(num(values.get("dependents")) or 0)
+        size = int(num(values.get("size")) or workforce + dependents)
         if size <= 0:
             continue
-        pop_type = top_value(block, "type") or top_value(block, "pop_type") or "unknown"
-        raw_culture = top_value(block, "culture") or "unknown"
+        pop_type = values.get("type") or values.get("pop_type") or "unknown"
+        raw_culture = values.get("culture") or "unknown"
         culture = culture_map.get(raw_culture, raw_culture)
-        religion = top_value(block, "religion") or "unknown"
-        workplace = top_value(block, "workplace") or ""
-        loyalist_balance = int(num(top_value(block, "loyalists_and_radicals")) or 0)
-        loyalists = int(num(top_value(block, "loyalists")) or 0)
-        radicals = int(num(top_value(block, "radicals")) or 0)
+        religion = values.get("religion") or "unknown"
+        workplace = values.get("workplace") or ""
+        loyalist_balance = int(num(values.get("loyalists_and_radicals")) or 0)
+        loyalists = int(num(values.get("loyalists")) or 0)
+        radicals = int(num(values.get("radicals")) or 0)
         if not loyalists and not radicals:
             if loyalist_balance >= 0:
                 loyalists = loyalist_balance
@@ -864,35 +977,52 @@ def parse_pops(txt: str, state_ids: set[int], country_id: int | None, culture_ma
     unanchored = 0
 
     entries = list(re.finditer(r"(?m)^(\d+)=(\{|none)", db))
+    pop_keys = {
+        "location",
+        "state",
+        "country",
+        "workforce",
+        "dependents",
+        "size",
+        "type",
+        "pop_type",
+        "culture",
+        "religion",
+        "workplace",
+        "loyalists_and_radicals",
+        "loyalists",
+        "radicals",
+    }
     for index, match in enumerate(entries):
         key = match.group(1)
         if match.group(2) == "none":
             continue
         end = entries[index + 1].start() if index + 1 < len(entries) else len(db)
         block = db[match.end() : end]
-        state = top_value(block, "location") or top_value(block, "state")
-        country = top_value(block, "country")
+        values = top_values(block, pop_keys)
+        state = values.get("location") or values.get("state")
+        country = values.get("country")
         if state_ids:
             if not state or not state.isdigit() or int(state) not in state_ids:
                 continue
         elif country_id is not None and country != str(country_id):
             continue
 
-        workforce = int(num(top_value(block, "workforce")) or 0)
-        dependents = int(num(top_value(block, "dependents")) or 0)
-        size = int(num(top_value(block, "size")) or workforce + dependents)
+        workforce = int(num(values.get("workforce")) or 0)
+        dependents = int(num(values.get("dependents")) or 0)
+        size = int(num(values.get("size")) or workforce + dependents)
         if size <= 0:
             continue
 
-        pop_type = top_value(block, "type") or top_value(block, "pop_type") or "unknown"
-        raw_culture = top_value(block, "culture") or "unknown"
+        pop_type = values.get("type") or values.get("pop_type") or "unknown"
+        raw_culture = values.get("culture") or "unknown"
         culture = (culture_map or {}).get(raw_culture, raw_culture)
-        religion = top_value(block, "religion") or "unknown"
-        workplace = top_value(block, "workplace") or ""
+        religion = values.get("religion") or "unknown"
+        workplace = values.get("workplace") or ""
 
-        row_loyalists = int(num(top_value(block, "loyalists")) or 0)
-        row_radicals = int(num(top_value(block, "radicals")) or 0)
-        loyalist_balance = int(num(top_value(block, "loyalists_and_radicals")) or 0)
+        row_loyalists = int(num(values.get("loyalists")) or 0)
+        row_radicals = int(num(values.get("radicals")) or 0)
+        loyalist_balance = int(num(values.get("loyalists_and_radicals")) or 0)
         if not row_loyalists and not row_radicals:
             if loyalist_balance >= 0:
                 row_loyalists = loyalist_balance
@@ -977,11 +1107,23 @@ def parse_interest_groups_for_countries(txt: str, countries: dict[int, dict], co
     if not db:
         return []
     rows = []
+    ig_keys = {
+        "country",
+        "definition",
+        "name",
+        "clout",
+        "political_strength",
+        "loyalists_political_strength",
+        "radicals_political_strength",
+        "in_government",
+        "approval",
+    }
     for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
         if not key.isdigit():
             continue
         block = db[open_pos + 1 : close]
-        country = top_value(block, "country")
+        values = top_values(block, ig_keys)
+        country = values.get("country")
         if not country or not country.isdigit():
             continue
         country_id = int(country)
@@ -992,13 +1134,13 @@ def parse_interest_groups_for_countries(txt: str, countries: dict[int, dict], co
                 "country_id": country_id,
                 "tag": countries.get(country_id, {}).get("tag", ""),
                 "interest_group_id": int(key),
-                "definition": (top_value(block, "definition") or top_value(block, "name") or "").strip('"'),
-                "clout": num(top_value(block, "clout")),
-                "political_strength": num(top_value(block, "political_strength")),
-                "loyalists_political_strength": num(top_value(block, "loyalists_political_strength")),
-                "radicals_political_strength": num(top_value(block, "radicals_political_strength")),
-                "in_government": top_value(block, "in_government") or "",
-                "approval": num(top_value(block, "approval")),
+                "definition": values.get("definition") or values.get("name") or "",
+                "clout": num(values.get("clout")),
+                "political_strength": num(values.get("political_strength")),
+                "loyalists_political_strength": num(values.get("loyalists_political_strength")),
+                "radicals_political_strength": num(values.get("radicals_political_strength")),
+                "in_government": values.get("in_government") or "",
+                "approval": num(values.get("approval")),
             }
         )
     return sorted(rows, key=lambda row: (row["tag"], -(row["clout"] or 0), row["definition"]))
@@ -1122,6 +1264,256 @@ def parse_pacts_for_countries(txt: str, countries: dict[int, dict], country_ids:
                 }
             )
     return sorted(rows, key=lambda row: (row["tag"], row["action"], row["partner_tag"]))
+
+
+def parse_market_data(txt: str, countries: dict[int, dict], all_states: list[dict]) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    db = database_block(txt, "market_manager")
+    markets_by_id: dict[int, dict] = {}
+    if db:
+        for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
+            if not key.isdigit():
+                continue
+            block = db[open_pos + 1 : close]
+            owner = top_value(block, "owner") or ""
+            owner_id = int(owner) if owner.isdigit() else None
+            markets_by_id[int(key)] = {
+                "market_id": int(key),
+                "owner_country_id": owner_id if owner_id is not None else "",
+                "owner_tag": countries.get(owner_id, {}).get("tag", "") if owner_id is not None else "",
+            }
+
+    members_by_market: dict[int, list[dict]] = {}
+    for country_id, row in countries.items():
+        market = row.get("market")
+        if not str(market).isdigit():
+            continue
+        members_by_market.setdefault(int(str(market)), []).append({"country_id": country_id, **row})
+        markets_by_id.setdefault(
+            int(str(market)),
+            {"market_id": int(str(market)), "owner_country_id": "", "owner_tag": ""},
+        )
+
+    states_by_market: dict[int, list[dict]] = {}
+    for state in all_states:
+        country_id = state.get("country_id")
+        market = countries.get(country_id, {}).get("market")
+        if str(market).isdigit():
+            states_by_market.setdefault(int(str(market)), []).append(state)
+
+    market_rows = []
+    for market_id, row in markets_by_id.items():
+        members = members_by_market.get(market_id, [])
+        states = states_by_market.get(market_id, [])
+        market_rows.append(
+            {
+                **row,
+                "member_country_count": len(members),
+                "member_tags": ";".join(sorted(member.get("tag", "") for member in members if member.get("tag"))),
+                "state_count": len(states),
+                "population": sum(member.get("population") or 0 for member in members),
+                "gdp": sum(member.get("gdp") or 0 for member in members),
+                "trade_capacity": sum(state.get("trade_capacity") or 0 for state in states),
+                "trade_capacity_usage": sum(state.get("trade_capacity_usage") or 0 for state in states),
+                "infrastructure": sum(state.get("infrastructure") or 0 for state in states),
+                "infrastructure_usage": sum(state.get("infrastructure_usage") or 0 for state in states),
+            }
+        )
+
+    member_rows = []
+    for market_id, members in members_by_market.items():
+        owner_id = markets_by_id.get(market_id, {}).get("owner_country_id")
+        for member in members:
+            member_rows.append(
+                {
+                    "market_id": market_id,
+                    "market_owner_id": owner_id,
+                    "market_owner_tag": countries.get(owner_id, {}).get("tag", "") if isinstance(owner_id, int) else "",
+                    "country_id": member["country_id"],
+                    "tag": member.get("tag", ""),
+                    "gdp": member.get("gdp"),
+                    "population": member.get("population"),
+                    "prestige": member.get("prestige"),
+                    "market_owner": member["country_id"] == owner_id,
+                }
+            )
+
+    state_rows = []
+    for state in all_states:
+        country_id = state.get("country_id")
+        market = countries.get(country_id, {}).get("market")
+        if not str(market).isdigit():
+            continue
+        owner_id = markets_by_id.get(int(str(market)), {}).get("owner_country_id")
+        trade_capacity = state.get("trade_capacity") or 0
+        trade_usage = state.get("trade_capacity_usage") or 0
+        state_rows.append(
+            {
+                "market_id": int(str(market)),
+                "market_owner_id": owner_id,
+                "market_owner_tag": countries.get(owner_id, {}).get("tag", "") if isinstance(owner_id, int) else "",
+                "country_id": country_id,
+                "tag": state.get("tag", ""),
+                "state_id": state.get("state_id"),
+                "region": state.get("region"),
+                "infrastructure": state.get("infrastructure"),
+                "infrastructure_usage": state.get("infrastructure_usage"),
+                "trade_capacity": trade_capacity,
+                "trade_capacity_usage": trade_usage,
+                "trade_capacity_balance": trade_capacity - trade_usage,
+                "devastation": state.get("devastation"),
+            }
+        )
+
+    trade_rows = []
+    for state in all_states:
+        country_id = state.get("country_id")
+        market = countries.get(country_id, {}).get("market")
+        for item in state.get("_trade_goods", []):
+            trade_rows.append(
+                {
+                    "market_id": int(str(market)) if str(market).isdigit() else "",
+                    "country_id": country_id,
+                    "tag": state.get("tag", ""),
+                    "state_id": state.get("state_id"),
+                    "region": state.get("region"),
+                    "goods_id": item.get("goods_id", ""),
+                    "goods_name": item.get("goods_name", ""),
+                    "trade_value": item.get("trade_value", ""),
+                }
+            )
+
+    return (
+        sorted(market_rows, key=lambda row: (-(row.get("gdp") or 0), row["market_id"])),
+        sorted(member_rows, key=lambda row: (row["market_id"], -(row.get("gdp") or 0), row["tag"])),
+        sorted(state_rows, key=lambda row: (row["market_id"], row["tag"], row["state_id"])),
+        sorted(trade_rows, key=lambda row: (row["market_id"], row["tag"], row["state_id"], row["goods_name"])),
+    )
+
+
+def parse_political_movements_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int]) -> list[dict]:
+    db = database_block(txt, "political_movement_manager")
+    if not db:
+        return []
+    rows = []
+    for key, open_pos, close in iter_top_blocks(db, 0, len(db)):
+        if not key.isdigit():
+            continue
+        block = db[open_pos + 1 : close]
+        country = top_value(block, "country")
+        if not country or not country.isdigit():
+            continue
+        country_id = int(country)
+        if country_id not in country_ids:
+            continue
+        identity = subblock(block, "identity")
+        modifiers = subblock(subblock(block, "timed_modifiers"), "modifiers") or ""
+        rows.append(
+            {
+                "movement_id": int(key),
+                "country_id": country_id,
+                "tag": countries.get(country_id, {}).get("tag", ""),
+                "identity_type": top_value(identity, "type") or "",
+                "ideology": top_value(block, "ideology") or "",
+                "character_ideologies": ";".join(list_value(block, "character_ideologies")),
+                "pop_count": len(list_value(block, "pops")),
+                "character_count": len(list_value(block, "characters")),
+                "start_date": top_value(block, "start_date") or "",
+                "radicalism": num(top_value(block, "radicalism")),
+                "religion": top_value(block, "religion") or "",
+                "culture": top_value(block, "culture") or "",
+                "last_failed_civil_war_start_date": top_value(block, "last_failed_civil_war_start_date") or "",
+                "modifier_count": len(re.findall(r"modifier=", modifiers)),
+                "modifiers": ";".join(re.findall(r"modifier=([A-Za-z0-9_\\-]+)", modifiers)),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["tag"], -(row.get("radicalism") or 0), row["identity_type"]))
+
+
+def parse_treaties_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int]) -> tuple[list[dict], list[dict]]:
+    treaty_db = database_block(txt, "treaty_manager")
+    article_db = database_block(txt, "treaty_article_manager")
+    raw_treaties: dict[int, dict] = {}
+    if treaty_db:
+        for key, open_pos, close in iter_top_blocks(treaty_db, 0, len(treaty_db)):
+            if not key.isdigit():
+                continue
+            block = treaty_db[open_pos + 1 : close]
+            first = top_value(block, "first_country") or ""
+            second = top_value(block, "second_country") or ""
+            name_block = subblock(block, "name") or ""
+            scripted = subblock(name_block, "scripted") or ""
+            dynamic = subblock(name_block, "dynamic") or ""
+            name_type = top_value(scripted, "scripted_name") or top_value(dynamic, "dynamic_name") or top_value(name_block, "scripted_name") or top_value(name_block, "dynamic_name") or ""
+            context = subblock(scripted, "context") or subblock(dynamic, "context") or ""
+            first_id = int(first) if first.isdigit() else None
+            second_id = int(second) if second.isdigit() else None
+            raw_treaties[int(key)] = {
+                "treaty_id": int(key),
+                "name_type": name_type,
+                "first_country_id": first_id if first_id is not None else "",
+                "first_tag": countries.get(first_id, {}).get("tag", "") if first_id is not None else "",
+                "second_country_id": second_id if second_id is not None else "",
+                "second_tag": countries.get(second_id, {}).get("tag", "") if second_id is not None else "",
+                "entered_into_force_on": top_value(block, "entered_into_force_on") or "",
+                "binding_period": num(top_value(block, "binding_period")),
+                "context_date": top_value(context, "date") or "",
+                "context_region": top_value(context, "region") or "",
+                "context_hub": top_value(context, "hub") or "",
+                "frozen_by_countries": ";".join(list_value(block, "frozen_by_countries")),
+            }
+
+    raw_articles = []
+    treaty_ids_from_articles: set[int] = set()
+    if article_db:
+        for key, open_pos, close in iter_top_blocks(article_db, 0, len(article_db)):
+            if not key.isdigit():
+                continue
+            block = article_db[open_pos + 1 : close]
+            treaty = top_value(block, "treaty") or ""
+            treaty_id = int(treaty) if treaty.isdigit() else None
+            source = top_value(block, "source_country") or ""
+            target = top_value(block, "target_country") or ""
+            source_id = int(source) if source.isdigit() and source != "4294967295" else None
+            target_id = int(target) if target.isdigit() and target != "4294967295" else None
+            treaty_row = raw_treaties.get(treaty_id if treaty_id is not None else -1, {})
+            involved = {value for value in (source_id, target_id, treaty_row.get("first_country_id"), treaty_row.get("second_country_id")) if isinstance(value, int)}
+            if involved & country_ids and treaty_id is not None:
+                treaty_ids_from_articles.add(treaty_id)
+            contraventions = subblock(block, "current_contraventions") or ""
+            raw_articles.append(
+                {
+                    "article_id": int(key),
+                    "treaty_id": treaty_id if treaty_id is not None else "",
+                    "article": top_value(block, "article") or "",
+                    "source_country_id": source_id if source_id is not None else "",
+                    "source_tag": countries.get(source_id, {}).get("tag", "") if source_id is not None else "",
+                    "target_country_id": target_id if target_id is not None else "",
+                    "target_tag": countries.get(target_id, {}).get("tag", "") if target_id is not None else "",
+                    "goods": top_value(block, "goods") or "",
+                    "quantity": num(top_value(block, "quantity")),
+                    "state": top_value(block, "state") or "",
+                    "law_type": top_value(block, "law_type") or "",
+                    "inputs": ";".join(list_value(block, "inputs")),
+                    "current_contraventions": ";".join(f"{match.group(1)}:{match.group(2)}" for match in re.finditer(r"(?m)^\\s*(\\d+)\\s*=\\s*([^\\s{}]+)", contraventions)),
+                    "first_country_id": treaty_row.get("first_country_id", ""),
+                    "first_tag": treaty_row.get("first_tag", ""),
+                    "second_country_id": treaty_row.get("second_country_id", ""),
+                    "second_tag": treaty_row.get("second_tag", ""),
+                }
+            )
+
+    treaty_rows = []
+    for treaty_id, row in raw_treaties.items():
+        first_id = row.get("first_country_id")
+        second_id = row.get("second_country_id")
+        if first_id in country_ids or second_id in country_ids or treaty_id in treaty_ids_from_articles:
+            treaty_rows.append(row)
+    treaty_id_set = {row["treaty_id"] for row in treaty_rows}
+    article_rows = [row for row in raw_articles if row.get("treaty_id") in treaty_id_set]
+    return (
+        sorted(treaty_rows, key=lambda row: (row["first_tag"], row["second_tag"], row["treaty_id"])),
+        sorted(article_rows, key=lambda row: (row["treaty_id"], row["article_id"])),
+    )
 
 
 def parse_companies_for_countries(txt: str, countries: dict[int, dict], country_ids: set[int]) -> list[dict]:
@@ -1600,7 +1992,14 @@ def write_system_document(
     tech_rows: list[dict],
     relation_rows: list[dict],
     pact_rows: list[dict],
+    market_rows: list[dict],
+    market_member_rows: list[dict],
+    market_state_rows: list[dict],
+    market_trade_goods_rows: list[dict],
     company_rows: list[dict],
+    political_movement_rows: list[dict],
+    treaty_rows: list[dict],
+    treaty_article_rows: list[dict],
     war_rows: list[dict],
     war_participant_rows: list[dict],
     diplomatic_play_rows: list[dict],
@@ -1670,7 +2069,20 @@ def write_system_document(
         igs = top_rows(rows_for(ig_rows, cid), "clout", 8)
         relations = rows_for(relation_rows, cid)
         pacts = rows_for(pact_rows, cid)
+        country_markets = [row for row in market_rows if row.get("market_id") == country.get("market") or row.get("owner_country_id") == cid or str(row.get("market_id")) == str(country.get("market"))]
+        market_states = rows_for(market_state_rows, cid)
+        market_goods = rows_for(market_trade_goods_rows, cid)
         companies = rows_for(company_rows, cid)
+        movements = rows_for(political_movement_rows, cid)
+        treaties = [row for row in treaty_rows if row.get("first_country_id") == cid or row.get("second_country_id") == cid]
+        treaty_articles = [
+            row
+            for row in treaty_article_rows
+            if row.get("source_country_id") == cid
+            or row.get("target_country_id") == cid
+            or row.get("first_country_id") == cid
+            or row.get("second_country_id") == cid
+        ]
         war_parts = rows_for(war_participant_rows, cid)
         country_wars = [war for war in war_rows if str(cid) in str(war.get("major_country_ids", "")).split(";")]
         plays = [row for row in diplomatic_play_rows if str(tag) in str(row.get("involved_tags", "")).split(";") or row.get("initiator_tag") == tag or row.get("target_tag") == tag]
@@ -1689,9 +2101,9 @@ def write_system_document(
 
         lines.extend(
             [
-                f"### {country['selection_order']}. {tag}",
+                f"### 国家 {country['selection_order']}：{tag}",
                 "",
-                "#### 基本位置",
+                "#### 1. 国家位置与宏观指标",
                 "",
                 f"- 国家ID：{cid}",
                 f"- 排名/等级：{country.get('power_rank') or 'NA'}；威望排名：{country.get('prestige_rank') or 'NA'}；威望：{fmt(country.get('prestige'), 2)}",
@@ -1701,7 +2113,7 @@ def write_system_document(
                 f"- 生活水平：{sol_text(country.get('sol'))}，变化 {sol_text(country.get('sol_change'))}；识字率：{pct(country.get('literacy'))}，变化 {pct(country.get('literacy_change'))}；恶名：{fmt(country.get('infamy'), 2)}",
                 f"- 政府：{nice_token(country.get('government'))}；市场：{country.get('market') or 'NA'}；首都州ID：{country.get('capital') or 'NA'}；合法性：{sol_text(country.get('legitimacy'))}",
                 "",
-                "#### 领土与基础设施",
+                "#### 2. 领土、州与基础设施",
                 "",
                 f"- 州数量：{len(states)}；已整合州：{len(incorporated)}；基建超载州：{len(infra_stressed)}；平均破坏度：{sol_text(sum((s.get('devastation') or 0) for s in states) / len(states)) if states else 'NA'}",
             ]
@@ -1719,7 +2131,7 @@ def write_system_document(
         ]
         if state_preview:
             lines.extend(md_table(state_preview, [("州/地区", "state"), ("基建", "infra"), ("使用", "used"), ("整合", "inc"), ("耕地", "arable"), ("破坏度", "dev")]))
-        lines.extend(["", "#### 经济与建筑体系", ""])
+        lines.extend(["", "#### 3. 经济、建筑与公司", ""])
         lines.append(f"- 建筑类型数：{len(buildings)}；建筑实例数：{country.get('building_entries')}")
         if categories:
             lines.extend(md_table([{"cat": c["category"], "levels": fmt(c["levels"], 0), "staff": fmt(c["staffing"], 1), "profit": fmt(c["profit"], 1)} for c in categories], [("部门", "cat"), ("等级", "levels"), ("雇佣", "staff"), ("利润", "profit")]))
@@ -1730,7 +2142,18 @@ def write_system_document(
         if companies:
             lines.extend(["", "公司与企业："])
             lines.extend(md_table([{"company": nice_token(c["company_type"]), "region": nice_token(c["state_region"]), "prosperity": sol_text(c["prosperity"]), "prod": sol_text(c["productivity_latest"]), "change": sol_text(c["productivity_change"])} for c in companies[:10]], [("公司", "company"), ("地区", "region"), ("繁荣度", "prosperity"), ("生产率", "prod"), ("生产率变化", "change")]))
-        lines.extend(["", "#### 人口、职业、文化、宗教", ""])
+        lines.extend(["", "#### 4. 市场与贸易结构", ""])
+        if country_markets:
+            lines.extend(md_table([{"id": m["market_id"], "owner": m["owner_tag"], "members": m["member_country_count"], "states": m["state_count"], "gdp": fmt(m["gdp"], 2), "trade": fmt(m["trade_capacity_usage"], 1) + "/" + fmt(m["trade_capacity"], 1)} for m in country_markets[:5]], [("市场ID", "id"), ("市场主", "owner"), ("成员国", "members"), ("州数", "states"), ("GDP", "gdp"), ("贸易容量使用", "trade")]))
+        if market_states:
+            stressed_market_states = sorted(market_states, key=lambda row: row.get("trade_capacity_balance") or 0)[:8]
+            lines.extend(["", "州级市场压力："])
+            lines.extend(md_table([{"state": nice_token(s["region"]), "cap": fmt(s["trade_capacity"], 1), "use": fmt(s["trade_capacity_usage"], 1), "bal": fmt(s["trade_capacity_balance"], 1), "infra": fmt(s["infrastructure_usage"], 1) + "/" + fmt(s["infrastructure"], 1)} for s in stressed_market_states], [("州", "state"), ("贸易容量", "cap"), ("已用", "use"), ("余量", "bal"), ("基建使用", "infra")]))
+        if market_goods:
+            top_goods = sorted(market_goods, key=lambda row: abs(row.get("trade_value") or 0), reverse=True)[:12]
+            lines.extend(["", "州级交易商品："])
+            lines.extend(md_table([{"state": nice_token(g["region"]), "goods": nice_token(g["goods_name"] or g["goods_id"]), "value": fmt(g["trade_value"], 1)} for g in top_goods], [("州", "state"), ("商品", "goods"), ("交易值", "value")]))
+        lines.extend(["", "#### 5. 人口、职业、文化、宗教", ""])
         if pop:
             lines.extend(
                 [
@@ -1746,15 +2169,18 @@ def write_system_document(
         if religions:
             lines.extend(["", "宗教构成："])
             lines.extend(md_table([{"d": r["dimension"], "pop": fmt(r["population"], 2), "share": pct(r["share"])} for r in religions], [("宗教", "d"), ("人口", "pop"), ("占比", "share")]))
-        lines.extend(["", "#### 法律、阶层与政治力量", ""])
+        lines.extend(["", "#### 6. 法律、阶层与政治运动", ""])
         lines.append("- 现行法律：" + ("、".join(nice_token(row["law"]) for row in laws) if laws else "未读到"))
         if igs:
             lines.extend(md_table([{"ig": nice_token(r["definition"]), "clout": pct(r["clout"]), "approval": sol_text(r["approval"]), "gov": r["in_government"]} for r in igs], [("利益集团", "ig"), ("影响力", "clout"), ("认可", "approval"), ("执政", "gov")]))
-        lines.extend(["", "#### 科技与现代化", ""])
+        if movements:
+            lines.extend(["", "政治运动："])
+            lines.extend(md_table([{"id": m["movement_id"], "type": nice_token(m["identity_type"]), "ideo": nice_token(m["ideology"]), "pops": m["pop_count"], "rad": sol_text(m["radicalism"]), "start": m["start_date"]} for m in movements[:10]], [("运动ID", "id"), ("类型", "type"), ("意识形态", "ideo"), ("人口组", "pops"), ("激进度", "rad"), ("开始", "start")]))
+        lines.extend(["", "#### 7. 科技与现代化", ""])
         lines.append(f"- 当前研究：{nice_token(tech.get('research_technology'))}；已掌握科技数：{tech.get('acquired_count', 'NA')}；正在扩散：{tech.get('spreading_count', 'NA')}")
         if tech.get("currently_spreading"):
             lines.append(f"- 扩散科技：{', '.join(nice_token(item) for item in str(tech.get('currently_spreading')).split(';') if item)}")
-        lines.extend(["", "#### 国际关系与外交结构", ""])
+        lines.extend(["", "#### 8. 国际关系、条约与外交结构", ""])
         lines.append(f"- 外交关系记录：{len(relations)}；条约/外交行动记录：{len(pacts)}")
         if best_rel:
             lines.extend(["", "关系较好对象："])
@@ -1765,7 +2191,13 @@ def write_system_document(
         if pacts:
             lines.extend(["", "主要条约/外交行动："])
             lines.extend(md_table([{"p": r["partner_tag"], "action": nice_token(r["action"]), "start": r["start_date"], "liberty": sol_text(r["liberty_desire"])} for r in pacts[:10]], [("对象", "p"), ("类型", "action"), ("开始", "start"), ("自由欲", "liberty")]))
-        lines.extend(["", "#### 战争与历史战争", ""])
+        if treaties:
+            lines.extend(["", "正式条约："])
+            lines.extend(md_table([{"id": t["treaty_id"], "name": nice_token(t["name_type"]), "with": t["second_tag"] if t["first_country_id"] == cid else t["first_tag"], "start": t["entered_into_force_on"], "period": fmt(t["binding_period"], 0), "region": nice_token(t["context_region"])} for t in treaties[:10]], [("条约ID", "id"), ("名称/类型", "name"), ("对象", "with"), ("生效", "start"), ("约束期", "period"), ("区域", "region")]))
+        if treaty_articles:
+            lines.extend(["", "条约条款："])
+            lines.extend(md_table([{"tid": a["treaty_id"], "article": nice_token(a["article"]), "src": a["source_tag"], "dst": a["target_tag"], "goods": nice_token(a["goods"]), "qty": fmt(a["quantity"], 0)} for a in treaty_articles[:12]], [("条约ID", "tid"), ("条款", "article"), ("来源", "src"), ("目标", "dst"), ("商品", "goods"), ("数量", "qty")]))
+        lines.extend(["", "#### 9. 战争与历史战争", ""])
         lines.append(f"- 相关战争记录：{len(country_wars)}；参战方记录：{len(war_parts)}；外交博弈：{len(plays)}；战争目标：{len(goals)}；战斗记录：{len(battles)}")
         if country_wars:
             lines.extend(md_table([{"id": w["war_id"], "status": w["status"], "start": w["start_date"], "peace": w["peace_date"], "majors": w["major_tags"], "parts": w["participant_tags"]} for w in country_wars[:10]], [("战争ID", "id"), ("状态", "status"), ("开始", "start"), ("结束", "peace"), ("主要国家", "majors"), ("参战方", "parts")]))
@@ -1791,7 +2223,7 @@ def write_system_document(
             total_dead = sum(row.get("dead") or 0 for row in casualties)
             total_wounded = sum(row.get("wounded") or 0 for row in casualties)
             lines.append(f"- 累计可读伤亡：死亡 {fmt(total_dead, 0)}；受伤 {fmt(total_wounded, 0)}。")
-        lines.extend(["", "#### 社会学解读", ""])
+        lines.extend(["", "#### 10. 社会学解读", ""])
         for note in social_reading(country, pop, cultures, types, igs):
             lines.append(f"- {note}")
         lines.append("")
@@ -1838,9 +2270,13 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
     relation_rows = parse_relations_for_countries(txt, countries, major_set)
     mark(70, "整理外交关系")
     pact_rows = parse_pacts_for_countries(txt, countries, major_set)
-    mark(72, "整理外交条约")
+    treaty_rows, treaty_article_rows = parse_treaties_for_countries(txt, countries, major_set)
+    mark(72, "整理外交条约与正式条款")
+    market_rows, market_member_rows, market_state_rows, market_trade_goods_rows = parse_market_data(txt, countries, all_states)
+    mark(73, "整理市场、成员国、州级贸易")
     company_rows = parse_companies_for_countries(txt, countries, major_set)
-    mark(74, "整理公司和GDP占比")
+    political_movement_rows = parse_political_movements_for_countries(txt, countries, major_set)
+    mark(74, "整理公司、GDP占比、政治运动")
     war_rows, war_participant_rows = parse_wars_for_countries(txt, countries, major_set)
     mark(76, "整理战争与参战方")
     diplomatic_play_rows, war_cost_rows = parse_diplomatic_plays_for_countries(txt, countries, major_set)
@@ -1913,6 +2349,10 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         "building_summary": REPORT_DIR / f"{stem}_building_summary.csv",
         "building_details": REPORT_DIR / f"{stem}_building_details.csv",
         "companies": REPORT_DIR / f"{stem}_companies.csv",
+        "markets": REPORT_DIR / f"{stem}_markets.csv",
+        "market_members": REPORT_DIR / f"{stem}_market_members.csv",
+        "market_states": REPORT_DIR / f"{stem}_market_states.csv",
+        "market_trade_goods": REPORT_DIR / f"{stem}_market_trade_goods.csv",
         "population_summary": REPORT_DIR / f"{stem}_population_summary.csv",
         "population_by_type": REPORT_DIR / f"{stem}_population_by_type.csv",
         "population_by_culture": REPORT_DIR / f"{stem}_population_by_culture.csv",
@@ -1922,6 +2362,9 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         "technology": REPORT_DIR / f"{stem}_technology.csv",
         "relations": REPORT_DIR / f"{stem}_relations.csv",
         "pacts": REPORT_DIR / f"{stem}_pacts.csv",
+        "political_movements": REPORT_DIR / f"{stem}_political_movements.csv",
+        "treaties": REPORT_DIR / f"{stem}_treaties.csv",
+        "treaty_articles": REPORT_DIR / f"{stem}_treaty_articles.csv",
         "wars": REPORT_DIR / f"{stem}_wars.csv",
         "war_participants": REPORT_DIR / f"{stem}_war_participants.csv",
         "diplomatic_plays": REPORT_DIR / f"{stem}_diplomatic_plays.csv",
@@ -1937,6 +2380,10 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
     write_csv(outputs["building_summary"], building_summary, ["country_id", "tag", "building", "sector", "building_count", "levels", "staffing", "goods_sales", "goods_cost", "profit_after_reserves"])
     write_csv(outputs["building_details"], building_details, ["country_id", "tag", "state_id", "building_id", "building", "levels", "staffing", "throughput", "salary_rate", "goods_sales", "goods_cost", "profit_after_reserves", "cash_reserves", "active"])
     write_csv(outputs["companies"], company_rows, ["company_id", "country_id", "tag", "company_type", "building_id", "state_region", "prosperity", "ceo", "productivity_start", "productivity_latest", "productivity_change", "productivity_change_pct", "productivity_samples"])
+    write_csv(outputs["markets"], market_rows, ["market_id", "owner_country_id", "owner_tag", "member_country_count", "member_tags", "state_count", "population", "gdp", "trade_capacity", "trade_capacity_usage", "infrastructure", "infrastructure_usage"])
+    write_csv(outputs["market_members"], market_member_rows, ["market_id", "market_owner_id", "market_owner_tag", "country_id", "tag", "gdp", "population", "prestige", "market_owner"])
+    write_csv(outputs["market_states"], market_state_rows, ["market_id", "market_owner_id", "market_owner_tag", "country_id", "tag", "state_id", "region", "infrastructure", "infrastructure_usage", "trade_capacity", "trade_capacity_usage", "trade_capacity_balance", "devastation"])
+    write_csv(outputs["market_trade_goods"], market_trade_goods_rows, ["market_id", "country_id", "tag", "state_id", "region", "goods_id", "goods_name", "trade_value"])
     write_csv(outputs["population_summary"], pop_summary, ["country_id", "tag", "population_detail", "workforce", "dependents", "loyalists", "radicals", "unanchored", "pop_entries"])
     write_csv(outputs["population_by_type"], pop_by_type, ["country_id", "tag", "dimension", "raw_dimension", "population", "share", "workforce", "dependents", "loyalists", "radicals"])
     write_csv(outputs["population_by_culture"], pop_by_culture, ["country_id", "tag", "dimension", "raw_dimension", "population", "share", "workforce", "dependents", "loyalists", "radicals"])
@@ -1946,6 +2393,9 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
     write_csv(outputs["technology"], tech_rows, ["country_id", "tag", "research_technology", "acquired_count", "spreading_count", "acquired_technologies", "currently_spreading"])
     write_csv(outputs["relations"], relation_rows, ["relation_id", "country_id", "tag", "partner_id", "partner_tag", "side", "relations", "improve_relations", "tension", "hostility", "obligation", "partner_obligation", "truce", "last_action"])
     write_csv(outputs["pacts"], pact_rows, ["pact_id", "country_id", "tag", "partner_id", "partner_tag", "side", "action", "start_date", "forced_duration", "liberty_desire"])
+    write_csv(outputs["political_movements"], political_movement_rows, ["movement_id", "country_id", "tag", "identity_type", "ideology", "character_ideologies", "pop_count", "character_count", "start_date", "radicalism", "religion", "culture", "last_failed_civil_war_start_date", "modifier_count", "modifiers"])
+    write_csv(outputs["treaties"], treaty_rows, ["treaty_id", "name_type", "first_country_id", "first_tag", "second_country_id", "second_tag", "entered_into_force_on", "binding_period", "context_date", "context_region", "context_hub", "frozen_by_countries"])
+    write_csv(outputs["treaty_articles"], treaty_article_rows, ["article_id", "treaty_id", "article", "source_country_id", "source_tag", "target_country_id", "target_tag", "goods", "quantity", "state", "law_type", "inputs", "current_contraventions", "first_country_id", "first_tag", "second_country_id", "second_tag"])
     write_csv(outputs["wars"], war_rows, ["war_id", "status", "diplomatic_play", "start_date", "peace_date", "days_since_exhaustion", "participant_country_ids", "participant_tags", "major_country_ids", "major_tags", "attacker_peace_country", "defender_peace_country", "attacker_last_proposal_date", "defender_last_proposal_date"])
     write_csv(outputs["war_participants"], war_participant_rows, ["war_id", "country_id", "tag", "diplomatic_play", "war_support", "initial_war_support", "battles_war_support_delta", "exhaustion_war_support_delta", "situations_war_support_delta", "violator"])
     write_csv(outputs["diplomatic_plays"], diplomatic_play_rows, ["diplomatic_play", "type", "state", "strategic_region", "initiator_id", "initiator_tag", "target_id", "target_tag", "initiator_side_tags", "target_side_tags", "involved_tags", "war", "escalation", "start_date", "end_date"])
@@ -1969,6 +2419,10 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
             "building_summary": len(building_summary),
             "building_details": len(building_details),
             "companies": len(company_rows),
+            "markets": len(market_rows),
+            "market_members": len(market_member_rows),
+            "market_states": len(market_state_rows),
+            "market_trade_goods": len(market_trade_goods_rows),
             "population_summary": len(pop_summary),
             "population_by_type": len(pop_by_type),
             "population_by_culture": len(pop_by_culture),
@@ -1978,6 +2432,9 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
             "technology": len(tech_rows),
             "relations": len(relation_rows),
             "pacts": len(pact_rows),
+            "political_movements": len(political_movement_rows),
+            "treaties": len(treaty_rows),
+            "treaty_articles": len(treaty_article_rows),
             "wars": len(war_rows),
             "war_participants": len(war_participant_rows),
             "diplomatic_plays": len(diplomatic_play_rows),
@@ -1999,18 +2456,20 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         f"- 主要国家数量：{len(countries_rows)}",
         f"- 人口结构：{'已完整扫描' if full_pops else '未扫描'}",
         "",
-        "## 固定表格",
-        "",
-        "| 表 | 内容 | 行数 |",
-        "|---|---|---:|",
+        "## 表格索引",
     ]
     labels = {
         "systems_document": "体系化国家文档：按国家逐项解读经济、社会、制度、外交",
+        "systems_report": "表格索引：按业务分组列出所有导出文件",
         "major_countries": "国家总表：经济、人口、威望、社会压力",
         "states": "州体系：各主要国家拥有州",
         "building_summary": "建筑体系汇总：按国家和建筑类型",
         "building_details": "建筑体系明细：按建筑实例",
         "companies": "公司/企业：公司类型、地区、繁荣度、生产率历史",
+        "markets": "市场总表：市场主、成员国、GDP、人口、贸易容量",
+        "market_members": "市场成员国：每个市场包含哪些国家",
+        "market_states": "市场州表：州级基建、贸易容量、破坏度",
+        "market_trade_goods": "州级交易商品：交易商品与贸易值",
         "population_summary": "人口总结构：劳动力、被扶养者、忠诚/激进",
         "population_by_type": "人口职业结构",
         "population_by_culture": "人口文化结构",
@@ -2020,6 +2479,9 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         "technology": "科技结构",
         "relations": "国际关系数值",
         "pacts": "外交条约/附庸/竞争/行动",
+        "political_movements": "政治运动：运动类型、意识形态、激进度、参与人口组",
+        "treaties": "正式条约：条约双方、生效日期、约束期、名称脚本",
+        "treaty_articles": "条约条款：防御、投资、贸易、商品、法律等具体条款",
         "wars": "战争/历史战争总表",
         "war_participants": "主要国家参战方、战争支持度和消耗",
         "diplomatic_plays": "外交博弈：战争双方阵营、升级、区域",
@@ -2030,9 +2492,27 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         "battle_casualties": "战斗伤亡：按国家和文化拆分",
         "systems_summary": "机器可读总索引 JSON",
     }
-    for key, label in labels.items():
-        rows = summary["counts"].get(key, 1 if key in {"systems_summary", "systems_document"} else "")
-        lines.append(f"| `{outputs[key].name}` | {label} | {rows} |")
+    table_groups = [
+        ("01 总览与索引", ["systems_document", "systems_report"]),
+        ("02 国家与州", ["major_countries", "states"]),
+        ("03 经济、市场、公司", ["building_summary", "building_details", "companies", "markets", "market_members", "market_states", "market_trade_goods"]),
+        ("04 人口、社会、政治", ["population_summary", "population_by_type", "population_by_culture", "population_by_religion", "interest_groups", "political_movements"]),
+        ("05 制度与科技", ["laws", "technology"]),
+        ("06 外交、条约、战争", ["relations", "pacts", "treaties", "treaty_articles", "diplomatic_plays", "war_goals", "wars", "war_participants", "war_costs", "military_formations", "battles", "battle_casualties"]),
+        ("07 机器数据", ["systems_summary"]),
+    ]
+
+    def output_name(key: str) -> str:
+        if key == "systems_report":
+            return outputs["systems_report"].name
+        return outputs[key].name
+
+    for group_title, keys in table_groups:
+        lines.extend(["", f"### {group_title}", "", "| 表 | 内容 | 行数 |", "|---|---|---:|"])
+        for key in keys:
+            label = labels[key]
+            rows = summary["counts"].get(key, 1 if key in {"systems_summary", "systems_document", "systems_report"} else "")
+            lines.append(f"| `{output_name(key)}` | {label} | {rows} |")
     lines.extend(["", "## 主要国家预览", ""])
     preview = [
         {
@@ -2066,7 +2546,14 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         tech_rows,
         relation_rows,
         pact_rows,
+        market_rows,
+        market_member_rows,
+        market_state_rows,
+        market_trade_goods_rows,
         company_rows,
+        political_movement_rows,
+        treaty_rows,
+        treaty_article_rows,
         war_rows,
         war_participant_rows,
         diplomatic_play_rows,

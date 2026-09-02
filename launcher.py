@@ -7,6 +7,7 @@ import base64
 import getpass
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -19,8 +20,10 @@ from pathlib import Path
 import analyze
 
 
+APP_VERSION = "0.1"
 CONFIG_DIR = Path.home() / ".vic3-save-analyzer"
 CONFIG_FILE = CONFIG_DIR / "api_config.json"
+SAVE_PREVIEW_CACHE: dict[tuple[str, float, int], dict] = {}
 
 PROVIDERS = {
     "1": {
@@ -51,24 +54,54 @@ PROVIDERS = {
 DEFAULT_PROVIDER = PROVIDERS["1"]
 DESKTOP_REPORT_ROOT = Path.home() / "Desktop" / "Victoria3存档报告"
 
+COMBINED_EXPORT_STEPS = [
+    (1, "定位存档"),
+    (18, "读取并展开存档"),
+    (20, "创建输出目录"),
+    (28, "生成快速报告"),
+    (48, "整理国家、州、经济建筑"),
+    (67, "扫描人口、职业、文化、宗教"),
+    (78, "整理市场、公司、政治运动、条约"),
+    (83, "整理外交、战争、军队、战斗"),
+    (87, "写出 CSV 表格"),
+    (96, "写出体系化文档"),
+    (97, "复制到桌面分类目录"),
+    (100, "完成并输出结论"),
+]
+
+API_EXPORT_STEPS = [
+    (1, "定位存档"),
+    (18, "读取并展开存档"),
+    (20, "创建输出目录"),
+    (35, "整理国家、州、经济建筑"),
+    (55, "扫描人口、社会结构"),
+    (65, "整理市场、政治、条约"),
+    (72, "整理外交、战争、军队"),
+    (75, "复制本地分类数据"),
+    (90, "等待 API 生成深度报表"),
+    (100, "完成并输出结论"),
+]
+
 
 class ProgressPrinter:
-    HEARTBEAT_SUFFIX = "，仍在处理"
-
-    def __init__(self, total_hint_seconds: int = 180) -> None:
+    def __init__(self, total_hint_seconds: int = 180, steps: list[tuple[int, str]] | None = None) -> None:
         self.started = time.time()
         self.total_hint_seconds = total_hint_seconds
         self.percent = 0
         self.label = "准备"
+        self.steps = steps or [(100, "完成")]
         self.last_percent = -1
         self.last_label = ""
         self.last_print = 0.0
+        self.line_len = 0
+        self.has_line = False
         self.done = False
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.done = False
+        print(f"流程：{len(self.steps)} 步，最后一步是「{self.steps[-1][1]}」")
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.thread.start()
 
@@ -77,6 +110,9 @@ class ProgressPrinter:
             self.done = True
         if self.thread:
             self.thread.join(timeout=0.3)
+        if self.has_line:
+            print()
+            self.has_line = False
 
     def _heartbeat(self) -> None:
         while True:
@@ -86,9 +122,7 @@ class ProgressPrinter:
                     return
                 percent = self.percent
                 label = self.label
-            while label.endswith(self.HEARTBEAT_SUFFIX):
-                label = label[: -len(self.HEARTBEAT_SUFFIX)]
-            self(percent, f"{label}{self.HEARTBEAT_SUFFIX}", force=True, remember=False)
+            self(percent, label, force=True, remember=False)
 
     @staticmethod
     def _clock(seconds: float) -> str:
@@ -96,25 +130,33 @@ class ProgressPrinter:
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
     @staticmethod
-    def _bar(percent: int) -> str:
-        width = 22
-        filled = int(width * percent / 100)
-        return "#" * filled + "-" * (width - filled)
+    def _short_label(label: str) -> str:
+        scan = re.search(r"扫描(人口|战斗)条目\s+([\d,]+)/([\d,]+)", label)
+        if scan:
+            kind, done_raw, total_raw = scan.groups()
+            done = int(done_raw.replace(",", ""))
+            total = int(total_raw.replace(",", ""))
+            left = max(total - done, 0)
+            return f"{kind}扫描 {done_raw}/{total_raw}，剩 {left:,} 条"
+        if "仍在处理" in label:
+            return label.replace("，仍在处理", "")
+        if len(label) > 32:
+            return label[:31] + "..."
+        return label
 
-    def _eta(self, percent: int, elapsed: float) -> str:
-        if percent >= 100:
-            return "00:00"
-        if percent <= 3:
-            return "计算中"
-        progress_total = elapsed / max(percent / 100, 0.01)
-        if elapsed < 20 and percent < 35:
-            estimated_total = max(progress_total, self.total_hint_seconds)
-        else:
-            estimated_total = max(progress_total, elapsed + 5)
-        remaining = max(estimated_total - elapsed, 0)
-        if percent < 95 and remaining < 10:
-            return "00:10内"
-        return self._clock(remaining)
+    @staticmethod
+    def _fit_line(text: str, previous_len: int) -> tuple[str, str]:
+        width = max(shutil.get_terminal_size((96, 20)).columns - 1, 48)
+        if len(text) > width:
+            text = text[: max(width - 3, 1)] + "..."
+        padding = " " * max(0, previous_len - len(text))
+        return text, padding
+
+    def _step(self, percent: int) -> tuple[int, str]:
+        for index, (upper, name) in enumerate(self.steps, 1):
+            if percent <= upper:
+                return index, name
+        return len(self.steps), self.steps[-1][1]
 
     def __call__(self, percent: int, label: str, force: bool = False, remember: bool = True) -> None:
         percent = max(0, min(100, int(percent)))
@@ -124,7 +166,6 @@ class ProgressPrinter:
             if remember:
                 self.label = label
             percent = self.percent
-            elapsed = max(now - self.started, 0.1)
             should_print = (
                 force
                 or percent != self.last_percent
@@ -136,10 +177,20 @@ class ProgressPrinter:
             self.last_percent = percent
             self.last_label = label
             self.last_print = now
-        print(
-            f"[{self._bar(percent)}] {percent:3d}%  {label} | "
-            f"已用 {self._clock(elapsed)} | 剩余约 {self._eta(percent, elapsed)}"
+        step_index, step_name = self._step(percent)
+        detail = self._short_label(label)
+        current = detail or step_name
+        if current == step_name:
+            current = step_name
+        text = (
+            f"进度 {percent:3d}%  "
+            f"步骤 {step_index:02d}/{len(self.steps):02d}  "
+            f"{current}"
         )
+        text, padding = self._fit_line(text, self.line_len)
+        print("\r" + text + padding, end="", flush=True)
+        self.line_len = len(text)
+        self.has_line = True
 
 
 def clear() -> None:
@@ -271,6 +322,78 @@ def saved_api_config() -> dict | None:
     return config
 
 
+def list_save_paths() -> list[Path]:
+    if not analyze.SAVE_DIR.exists():
+        return []
+    return sorted(analyze.SAVE_DIR.glob("*.v3"), key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def save_preview(path: Path) -> dict:
+    stat = path.stat()
+    cache_key = (str(path), stat.st_mtime, stat.st_size)
+    cached = SAVE_PREVIEW_CACHE.get(cache_key)
+    if cached:
+        return cached
+    txt = None
+    try:
+        txt = analyze.read_save(path)
+        meta_info = analyze.meta(txt)
+        countries = analyze.parse_countries(txt)
+        player_id = analyze.player_country_id(txt, countries, str(meta_info["country"]))
+        identity = analyze.save_identity(meta_info, countries, player_id)
+        preview = {
+            "path": path,
+            "country": identity["country"],
+            "date": identity["date"],
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "status": "可读",
+        }
+        SAVE_PREVIEW_CACHE[cache_key] = preview
+        return preview
+    except Exception as exc:
+        preview = {
+            "path": path,
+            "country": "读取失败",
+            "date": "未知日期",
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+            "status": str(exc)[:40],
+        }
+        SAVE_PREVIEW_CACHE[cache_key] = preview
+        return preview
+    finally:
+        if txt is not None:
+            analyze.clear_database_block_cache(txt)
+
+
+def choose_save_path() -> Path | None:
+    saves = list_save_paths()
+    if not saves:
+        print("没有找到 Victoria 3 存档。")
+        return None
+
+    print("\n正在扫描存档列表，只读取国家和游戏日期...")
+    previews = []
+    for index, path in enumerate(saves, 1):
+        text = f"扫描存档 {index}/{len(saves)}，剩 {len(saves) - index} 个：{path.name}"
+        print("\r" + text + " " * 30, end="", flush=True)
+        previews.append(save_preview(path))
+    print()
+
+    line("选择要导出的存档")
+    for index, item in enumerate(previews, 1):
+        latest = " 最新" if index == 1 else ""
+        print(f"[{index}] {item['country']} | {item['date']} | {item['modified']} | {item['path'].name}{latest}")
+    print("[0] 返回")
+
+    choice = ask("\n选择：").strip()
+    if not choice or choice == "0":
+        return None
+    if not choice.isdigit() or not (1 <= int(choice) <= len(previews)):
+        print("选择无效。")
+        return None
+    return previews[int(choice) - 1]["path"]
+
+
 def normalize_chat_endpoint(config: dict) -> str:
     base_url = (config.get("base_url") or DEFAULT_PROVIDER["base_url"]).strip().rstrip("/")
     endpoint = (config.get("endpoint") or DEFAULT_PROVIDER["endpoint"]).strip()
@@ -310,50 +433,87 @@ def copy_to_category(path: Path, target_dir: Path) -> None:
 
 def categorize_run_outputs(run_dir: Path, quick_report: Path | None, quick_outputs: dict[str, Path], outputs: dict[str, Path]) -> None:
     categories = {
-        "01_总览文档": ["systems_document", "systems_report"],
-        "02_快速报告": ["summary_json", "countries_csv", "great_powers_csv", "states_csv", "buildings_csv", "laws_csv"],
-        "03_经济公司": ["major_countries", "building_summary", "building_details", "companies"],
-        "04_人口社会": ["population_summary", "population_by_type", "population_by_culture", "population_by_religion", "pops_csv", "pops_by_type_csv", "pops_by_culture_csv", "pops_by_religion_csv"],
-        "05_制度外交科技战争": [
-            "laws",
+        "01_总览索引": ["systems_document", "systems_report"],
+        "02_国家总表": ["major_countries", "states"],
+        "03_经济市场公司": [
+            "building_summary",
+            "building_details",
+            "companies",
+            "markets",
+            "market_members",
+            "market_states",
+            "market_trade_goods",
+        ],
+        "04_人口社会政治": [
+            "population_summary",
+            "population_by_type",
+            "population_by_culture",
+            "population_by_religion",
             "interest_groups",
-            "technology",
+            "political_movements",
+            "pops_csv",
+            "pops_by_type_csv",
+            "pops_by_culture_csv",
+            "pops_by_religion_csv",
+        ],
+        "05_制度科技": ["laws", "technology"],
+        "06_外交条约战争": [
             "relations",
             "pacts",
+            "treaties",
+            "treaty_articles",
+            "diplomatic_plays",
+            "war_goals",
             "wars",
             "war_participants",
-            "diplomatic_plays",
             "war_costs",
-            "war_goals",
             "military_formations",
             "battles",
             "battle_casualties",
         ],
-        "06_机器数据": ["systems_summary"],
+        "07_快速报告": ["summary_json", "countries_csv", "great_powers_csv", "states_csv", "buildings_csv", "laws_csv"],
+        "08_机器数据": ["systems_summary"],
     }
     if quick_report:
-        copy_to_category(quick_report, run_dir / "02_快速报告")
+        copy_to_category(quick_report, run_dir / "07_快速报告")
     merged = {**quick_outputs, **outputs}
     for dirname, keys in categories.items():
         for key in keys:
             copy_to_category(merged.get(key), run_dir / dirname)
 
 
-def run_combined_export() -> None:
-    print("\n正在一键导出：快速报告 + 体系化国家文档...")
-    path = analyze.find_latest_save()
+def print_combined_summary(started: float, run_dir: Path, quick_report: Path, quick_outputs: dict[str, Path], document: Path, outputs: dict[str, Path]) -> None:
+    elapsed = ProgressPrinter._clock(time.time() - started)
+    print("\n结论：一键导出完成。")
+    print(f"总耗时：{elapsed}")
+    print("最后一步：复制全部报告和表格到桌面分类目录。")
+    print(f"输出目录：{run_dir}")
+    print(f"主报告：{document}")
+    print(f"表格索引：{outputs['systems_report']}")
+    print(f"快速报告：{quick_report}")
+    print(f"总索引 JSON：{outputs['systems_summary']}")
+    print(f"建议先打开：{run_dir / '01_总览索引'}")
+
+
+def run_combined_export(path: Path | None = None) -> None:
+    latest_mode = path is None
+    print("\n正在导出：快速报告 + 体系化国家文档...")
+    if latest_mode:
+        path = analyze.find_latest_save()
     if not path:
         print("没有找到 Victoria 3 存档。")
         return
-    progress = ProgressPrinter(total_hint_seconds=240)
+    progress = ProgressPrinter(total_hint_seconds=240, steps=COMBINED_EXPORT_STEPS)
     progress.start()
+    txt = None
     try:
-        progress(1, "找到最新存档")
+        progress(1, "找到最新存档" if latest_mode else f"已选择存档：{path.name}")
         progress(5, "读取并展开存档")
         txt = analyze.read_save(path)
         progress(18, "存档读取完成")
         run_dir = prepare_desktop_output(path, txt)
         progress(20, "创建桌面分类目录")
+        progress(21, "生成快速报告")
         quick_report, quick_outputs = analyze.build_report(path, txt, full_pops=False)
         progress(28, "快速报告完成")
         document, outputs = analyze.build_system_export(
@@ -370,14 +530,11 @@ def run_combined_export() -> None:
         progress.stop()
         print(f"\n导出失败：{exc}")
         return
+    finally:
+        if txt is not None:
+            analyze.clear_database_block_cache(txt)
     progress.stop()
-    print("\n一键导出完成。")
-    print(f"桌面分类目录：{run_dir}")
-    print(f"快速报告：{quick_report}")
-    print(f"快速摘要 JSON：{quick_outputs['summary_json']}")
-    print(f"体系文档：{document}")
-    print(f"表格索引：{outputs['systems_report']}")
-    print(f"总索引 JSON：{outputs['systems_summary']}")
+    print_combined_summary(progress.started, run_dir, quick_report, quick_outputs, document, outputs)
     try:
         os.startfile(document)
         os.startfile(run_dir)
@@ -409,10 +566,17 @@ def compact_system_bundle_for_api(document: Path, outputs: dict[str, Path]) -> s
         "population_by_religion": 25_000,
         "building_summary": 45_000,
         "building_details": 45_000,
+        "markets": 35_000,
+        "market_members": 35_000,
+        "market_states": 45_000,
+        "market_trade_goods": 45_000,
         "laws": 35_000,
         "interest_groups": 35_000,
+        "political_movements": 35_000,
         "relations": 35_000,
         "pacts": 35_000,
+        "treaties": 35_000,
+        "treaty_articles": 45_000,
         "wars": 45_000,
         "war_participants": 45_000,
         "diplomatic_plays": 45_000,
@@ -446,7 +610,8 @@ def call_chat_api(config: dict, content: str) -> str:
                 "role": "user",
                 "content": (
                     "请生成一份分类数据报表，不要先做分析。按固定栏目输出：国家总表、GDP占比、历史变化、"
-                    "公司与企业、建筑部门、人口职业、文化宗教、法律制度、利益集团、科技、外交关系、"
+                    "公司与企业、建筑部门、市场总表、市场成员、州级贸易商品、人口职业、文化宗教、"
+                    "法律制度、利益集团、政治运动、科技、外交关系、外交行动、正式条约、条约条款、"
                     "外交博弈、战争目标、军队编成、战斗记录、伤亡、战争成本、占领推进和州破坏度。"
                     "战争和历史战争必须融入外交与国家分表，列出战争状态、起止时间、参战方、战争支持度和消耗。"
                     "每一类先给表格，再给极短字段说明；不要提出下一步玩法。\n\n"
@@ -480,16 +645,30 @@ def call_chat_api(config: dict, content: str) -> str:
     return result["choices"][0]["message"].get("content", "")
 
 
-def run_api_analysis(config: dict) -> None:
+def print_api_summary(started: float, run_dir: Path, out: Path, document: Path, outputs: dict[str, Path]) -> None:
+    elapsed = ProgressPrinter._clock(time.time() - started)
+    print("\n结论：API 深度报表完成。")
+    print(f"总耗时：{elapsed}")
+    print("最后一步：保存 API 报表并复制到总览索引目录。")
+    print(f"输出目录：{run_dir}")
+    print(f"API 报表：{out}")
+    print(f"本地体系主报告：{document}")
+    print(f"表格索引：{outputs['systems_report']}")
+
+
+def run_api_analysis(config: dict, path: Path | None = None) -> None:
     print("\n正在生成本地分类数据并准备 API 报表，大存档可能需要几分钟...")
-    path = analyze.find_latest_save()
+    if path is None:
+        path = analyze.find_latest_save()
     if not path:
         print("没有找到 Victoria 3 存档。")
         return
-    progress = ProgressPrinter(total_hint_seconds=300)
+    total_started = time.time()
+    progress = ProgressPrinter(total_hint_seconds=300, steps=API_EXPORT_STEPS)
     progress.start()
+    txt = None
     try:
-        progress(1, "找到最新存档")
+        progress(1, f"准备存档：{path.name}")
         progress(5, "读取并展开存档")
         txt = analyze.read_save(path)
         progress(18, "存档读取完成")
@@ -509,10 +688,13 @@ def run_api_analysis(config: dict) -> None:
         progress.stop()
         print(f"\n本地体系数据生成失败：{exc}")
         return
+    finally:
+        if txt is not None:
+            analyze.clear_database_block_cache(txt)
     progress.stop()
     print("正在调用 API 生成分类报表...")
     api_content = compact_system_bundle_for_api(document, outputs)
-    api_progress = ProgressPrinter(total_hint_seconds=90)
+    api_progress = ProgressPrinter(total_hint_seconds=90, steps=API_EXPORT_STEPS)
     api_progress.start()
     api_progress(80, "等待 API 生成深度报表")
     try:
@@ -525,12 +707,10 @@ def run_api_analysis(config: dict) -> None:
 
     out = document.with_name(document.stem + "_api_tables.md")
     out.write_text("# API 深挖分类报表\n\n" + answer + "\n", encoding="utf-8")
-    copy_to_category(out, run_dir / "01_总览文档")
+    copy_to_category(out, run_dir / "01_总览索引")
     api_progress(100, "API 报表完成")
     api_progress.stop()
-    print("\nAPI 报表完成。")
-    print(f"桌面分类目录：{run_dir}")
-    print(f"API报表：{out}")
+    print_api_summary(total_started, run_dir, out, document, outputs)
     try:
         os.startfile(out)
     except OSError:
@@ -541,7 +721,7 @@ def api_menu() -> None:
     while True:
         clear()
         config = load_config()
-        line("Victoria 3 存档读取器 - API 深度报表")
+        line(f"Victoria 3 存档读取器 v{APP_VERSION} - API 深度报表")
         print(f"已保存：{saved_label(config)}")
         print()
         print("[1] 临时导入 API 并生成报表")
@@ -574,19 +754,25 @@ def main() -> None:
     while True:
         clear()
         config = load_config()
-        line("Victoria 3 存档读取器")
+        line(f"Victoria 3 存档读取器 v{APP_VERSION}")
         print(f"API：{saved_label(config)}")
         print()
-        print("[1] 一键导出：快速报告 + 体系化文档")
-        print("[2] API 深度报表")
+        print("[1] 选择存档导出")
+        print("[2] 直接导出最新存档")
+        print("[3] API 深度报表")
         print("[0] 退出")
         choice = ask("\n选择：").strip()
         if not choice:
             sys.exit(0)
         if choice == "1":
+            selected = choose_save_path()
+            if selected:
+                run_combined_export(selected)
+                pause()
+        elif choice == "2":
             run_combined_export()
             pause()
-        elif choice == "2":
+        elif choice == "3":
             api_menu()
         elif choice == "0":
             sys.exit(0)

@@ -1,5 +1,7 @@
 # Victoria 3 Save Analyzer / Vic3 存档读取器
 
+Current version: v0.1
+
 Victoria 3 save parser and report exporter for Paradox grand strategy saves. It extracts country systems, GDP share, historical trends, buildings, companies, population structure, laws, interest groups, diplomacy, wars, and historical wars into Markdown, CSV, and JSON reports.
 
 中文：这是一个维多利亚 3 存档读取器，会把 `.v3` 存档整理成体系化国家档案和分类报表。它不是玩法攻略工具，默认目标是把国家的经济、建筑、人口、制度、外交和战争数据完整导出来。
@@ -18,8 +20,8 @@ Victoria 3, Vic3, Victoria 3 save analyzer, Victoria 3 save parser, Vic3 save re
 - Adds GDP share, GDP per capita, GDP history, prestige history, literacy history, and standard-of-living history.
 - Exports companies and enterprise productivity trends.
 - Exports population by job, culture, religion, loyalists, radicals, workforce, and dependents.
-- Exports laws, interest groups, technology, relations, pacts, diplomatic plays, war goals, armies/navies, battles, casualties, wars, and historical wars.
-- Shows progress percentage and estimated remaining time in the one-click desktop exporter.
+- Exports markets, market members, state trade goods, laws, political movements, interest groups, technology, relations, pacts, formal treaties, treaty articles, diplomatic plays, war goals, armies/navies, battles, casualties, wars, and historical wars.
+- Shows a compact single-line export progress indicator with step count and remaining scan items.
 - Optional DeepSeek/OpenAI-compatible API report mode for classified tables.
 
 ## Quick Start
@@ -41,8 +43,9 @@ run-analyzer.bat
 Launcher menu:
 
 ```text
-[1] 一键导出：快速报告 + 体系化文档
-[2] API 深度报表
+[1] 选择存档导出
+[2] 直接导出最新存档
+[3] API 深度报表
 [0] 退出
 ```
 
@@ -65,12 +68,14 @@ Every exported file is also prefixed with the save's in-game country and in-game
 When launched from the UI, reports are categorized as:
 
 ```text
-01_总览文档
-02_快速报告
-03_经济公司
-04_人口社会
-05_制度外交科技战争
-06_机器数据
+01_总览索引
+02_国家总表
+03_经济市场公司
+04_人口社会政治
+05_制度科技
+06_外交条约战争
+07_快速报告
+08_机器数据
 ```
 
 Important outputs:
@@ -84,15 +89,22 @@ Important outputs:
 | `*_systems_building_summary.csv` | building summary by country and building type |
 | `*_systems_building_details.csv` | building instance details |
 | `*_systems_companies.csv` | company type, country, region, prosperity, productivity history |
+| `*_systems_markets.csv` | market owner, members, GDP, population, state count, trade capacity |
+| `*_systems_market_members.csv` | countries inside each market |
+| `*_systems_market_states.csv` | state-level market infrastructure and trade capacity |
+| `*_systems_market_trade_goods.csv` | state-level traded goods and trade value |
 | `*_systems_population_summary.csv` | population, workforce, dependents, loyalists, radicals |
 | `*_systems_population_by_type.csv` | population by job |
 | `*_systems_population_by_culture.csv` | population by culture |
 | `*_systems_population_by_religion.csv` | population by religion |
 | `*_systems_laws.csv` | active laws and institutions |
 | `*_systems_interest_groups.csv` | interest group clout, approval, and political strength |
+| `*_systems_political_movements.csv` | political movement identity, ideology, radicalism, participating pop count |
 | `*_systems_technology.csv` | research and acquired technologies |
 | `*_systems_relations.csv` | bilateral relations |
 | `*_systems_pacts.csv` | diplomatic pacts and actions |
+| `*_systems_treaties.csv` | formal treaties, countries, start date, binding period |
+| `*_systems_treaty_articles.csv` | treaty article details such as defense, trade, goods, law, investment |
 | `*_systems_wars.csv` | active and historical wars |
 | `*_systems_war_participants.csv` | war support and exhaustion by participating country |
 | `*_systems_diplomatic_plays.csv` | diplomatic play sides, escalation, region, linked war |
