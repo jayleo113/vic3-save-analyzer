@@ -1,5 +1,8 @@
 # Local generated output
 reports/
+exports/
+data_cache/
+public_share/
 *.melted.txt
 *.log
 
@@ -10,6 +13,7 @@ save games/
 
 # Local configuration and secrets
 api_config.json
+config/
 .env
 .env.*
 
@@ -24,6 +28,7 @@ venv/
 
 # Bundled third-party clones and local backups
 community/
+tools/
 往期版本/
 *.codex_backup
 启动F盘维多利亚3存档读取器.bat

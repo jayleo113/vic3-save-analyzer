@@ -9,21 +9,27 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
 import analyze
+from vic3_analyzer import md_library, terminal_ui
+from vic3_analyzer.progress import ProgressPrinter
 
 
-APP_VERSION = "0.1"
-CONFIG_DIR = Path.home() / ".vic3-save-analyzer"
+APP_VERSION = "0.2"
+PROJECT_DIR = Path(__file__).resolve().parent
+CONFIG_DIR = PROJECT_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "api_config.json"
+LEGACY_CONFIG_FILE = Path.home() / ".vic3-save-analyzer" / "api_config.json"
 SAVE_PREVIEW_CACHE: dict[tuple[str, float, int], dict] = {}
+PREVIEW_BYTES = 512_000
 
 PROVIDERS = {
     "1": {
@@ -52,169 +58,54 @@ PROVIDERS = {
     },
 }
 DEFAULT_PROVIDER = PROVIDERS["1"]
-DESKTOP_REPORT_ROOT = Path.home() / "Desktop" / "Victoria3存档报告"
+EXPORT_ROOT = PROJECT_DIR / "exports"
+DATA_CACHE_ROOT = PROJECT_DIR / "data_cache"
+DESKTOP_MD_ROOT = Path.home() / "Desktop" / "Victoria3存档MD报告"
+MD_CACHE_ROOT = DATA_CACHE_ROOT / "md_library"
 
 COMBINED_EXPORT_STEPS = [
     (1, "定位存档"),
-    (18, "读取并展开存档"),
-    (20, "创建输出目录"),
+    (18, "读取存档"),
+    (20, "建目录"),
     (28, "生成快速报告"),
-    (48, "整理国家、州、经济建筑"),
-    (67, "扫描人口、职业、文化、宗教"),
-    (78, "整理市场、公司、政治运动、条约"),
-    (83, "整理外交、战争、军队、战斗"),
-    (87, "写出 CSV 表格"),
-    (96, "写出体系化文档"),
-    (97, "复制到桌面分类目录"),
-    (100, "完成并输出结论"),
+    (48, "国家与经济"),
+    (67, "人口结构"),
+    (78, "市场与政治"),
+    (83, "外交战争"),
+    (87, "写表格"),
+    (96, "写文档"),
+    (97, "复制文件"),
+    (100, "完成"),
 ]
 
 API_EXPORT_STEPS = [
     (1, "定位存档"),
-    (18, "读取并展开存档"),
-    (20, "创建输出目录"),
-    (35, "整理国家、州、经济建筑"),
-    (55, "扫描人口、社会结构"),
-    (65, "整理市场、政治、条约"),
-    (72, "整理外交、战争、军队"),
-    (75, "复制本地分类数据"),
-    (90, "等待 API 生成深度报表"),
-    (100, "完成并输出结论"),
+    (18, "读取存档"),
+    (20, "建目录"),
+    (35, "国家与经济"),
+    (55, "人口结构"),
+    (65, "市场政治"),
+    (72, "外交战争"),
+    (75, "复制文件"),
+    (90, "API 生成"),
+    (100, "完成"),
 ]
 
 
-class ProgressPrinter:
-    def __init__(self, total_hint_seconds: int = 180, steps: list[tuple[int, str]] | None = None) -> None:
-        self.started = time.time()
-        self.total_hint_seconds = total_hint_seconds
-        self.percent = 0
-        self.label = "准备"
-        self.steps = steps or [(100, "完成")]
-        self.last_percent = -1
-        self.last_label = ""
-        self.last_print = 0.0
-        self.line_len = 0
-        self.has_line = False
-        self.done = False
-        self.lock = threading.Lock()
-        self.thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self.done = False
-        print(f"流程：{len(self.steps)} 步，最后一步是「{self.steps[-1][1]}」")
-        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
-        self.thread.start()
-
-    def stop(self) -> None:
-        with self.lock:
-            self.done = True
-        if self.thread:
-            self.thread.join(timeout=0.3)
-        if self.has_line:
-            print()
-            self.has_line = False
-
-    def _heartbeat(self) -> None:
-        while True:
-            time.sleep(8)
-            with self.lock:
-                if self.done:
-                    return
-                percent = self.percent
-                label = self.label
-            self(percent, label, force=True, remember=False)
-
-    @staticmethod
-    def _clock(seconds: float) -> str:
-        seconds = max(0, int(seconds))
-        return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-    @staticmethod
-    def _short_label(label: str) -> str:
-        scan = re.search(r"扫描(人口|战斗)条目\s+([\d,]+)/([\d,]+)", label)
-        if scan:
-            kind, done_raw, total_raw = scan.groups()
-            done = int(done_raw.replace(",", ""))
-            total = int(total_raw.replace(",", ""))
-            left = max(total - done, 0)
-            return f"{kind}扫描 {done_raw}/{total_raw}，剩 {left:,} 条"
-        if "仍在处理" in label:
-            return label.replace("，仍在处理", "")
-        if len(label) > 32:
-            return label[:31] + "..."
-        return label
-
-    @staticmethod
-    def _fit_line(text: str, previous_len: int) -> tuple[str, str]:
-        width = max(shutil.get_terminal_size((96, 20)).columns - 1, 48)
-        if len(text) > width:
-            text = text[: max(width - 3, 1)] + "..."
-        padding = " " * max(0, previous_len - len(text))
-        return text, padding
-
-    def _step(self, percent: int) -> tuple[int, str]:
-        for index, (upper, name) in enumerate(self.steps, 1):
-            if percent <= upper:
-                return index, name
-        return len(self.steps), self.steps[-1][1]
-
-    def __call__(self, percent: int, label: str, force: bool = False, remember: bool = True) -> None:
-        percent = max(0, min(100, int(percent)))
-        now = time.time()
-        with self.lock:
-            self.percent = max(self.percent, percent)
-            if remember:
-                self.label = label
-            percent = self.percent
-            should_print = (
-                force
-                or percent != self.last_percent
-                or label != self.last_label
-                or now - self.last_print >= 6
-            )
-            if not should_print:
-                return
-            self.last_percent = percent
-            self.last_label = label
-            self.last_print = now
-        step_index, step_name = self._step(percent)
-        detail = self._short_label(label)
-        current = detail or step_name
-        if current == step_name:
-            current = step_name
-        text = (
-            f"进度 {percent:3d}%  "
-            f"步骤 {step_index:02d}/{len(self.steps):02d}  "
-            f"{current}"
-        )
-        text, padding = self._fit_line(text, self.line_len)
-        print("\r" + text + padding, end="", flush=True)
-        self.line_len = len(text)
-        self.has_line = True
-
-
 def clear() -> None:
-    os.system("cls" if os.name == "nt" else "clear")
+    terminal_ui.clear()
 
 
 def pause() -> None:
-    try:
-        input("\n按回车返回...")
-    except EOFError:
-        return
+    terminal_ui.pause()
 
 
 def ask(prompt: str) -> str:
-    try:
-        return input(prompt)
-    except EOFError:
-        return ""
+    return terminal_ui.ask(prompt)
 
 
 def line(title: str = "") -> None:
-    if title:
-        print(title)
-    print("-" * 42)
+    terminal_ui.title(title)
 
 
 def mask(value: str | None) -> str:
@@ -236,10 +127,11 @@ def decode_secret(value: str | None) -> str:
 
 
 def load_config() -> dict:
-    if not CONFIG_FILE.exists():
+    source = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
+    if not source.exists():
         return {}
     try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return json.loads(source.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
 
@@ -305,7 +197,7 @@ def input_api_config(save: bool) -> dict | None:
     }
     if save:
         save_config(config)
-        print(f"已保存 API 设置到 C 盘配置：{CONFIG_FILE}")
+        print(f"已保存 API 设置：{CONFIG_FILE}")
     return config
 
 
@@ -323,9 +215,56 @@ def saved_api_config() -> dict | None:
 
 
 def list_save_paths() -> list[Path]:
-    if not analyze.SAVE_DIR.exists():
-        return []
-    return sorted(analyze.SAVE_DIR.glob("*.v3"), key=lambda item: item.stat().st_mtime, reverse=True)
+    return analyze.list_save_paths()
+
+
+def file_size_label(size: int) -> str:
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024 * 1024):.1f}GB"
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f}MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size}B"
+
+
+def save_source_label(path: Path) -> str:
+    text = str(path).lower()
+    if "\\steam\\userdata\\" in text or "/steam/userdata/" in text:
+        return "Steam云"
+    if "\\onedrive\\" in text or "/onedrive/" in text:
+        return "OneDrive"
+    return "本地文档"
+
+
+def read_save_preview_text(path: Path, max_bytes: int = PREVIEW_BYTES) -> str:
+    with path.open("rb") as handle:
+        magic = handle.read(4)
+    if magic.startswith(b"PK"):
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            target = "gamestate" if "gamestate" in names else names[0]
+            with zf.open(target) as handle:
+                return handle.read(max_bytes).decode("utf-8", errors="replace")
+    with path.open("rb") as handle:
+        return handle.read(max_bytes).decode("utf-8", errors="replace")
+
+
+def preview_value(text: str, key: str) -> str:
+    match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*(\"[^\"]*\"|[^\s{{}}]+)", text)
+    if not match:
+        return ""
+    return match.group(1).strip().strip('"')
+
+
+def filename_save_hint(path: Path) -> tuple[str, str]:
+    stem = path.stem.strip()
+    match = re.search(r"(.+?)[_\-\s]+(\d{4})[_\-\s]+(\d{1,2})[_\-\s]+(\d{1,2})", stem)
+    if match:
+        country = match.group(1).strip("_- ")
+        year, month, day = match.group(2), int(match.group(3)), int(match.group(4))
+        return country or stem, f"{year}-{month:02d}-{day:02d}"
+    return stem, ""
 
 
 def save_preview(path: Path) -> dict:
@@ -334,17 +273,22 @@ def save_preview(path: Path) -> dict:
     cached = SAVE_PREVIEW_CACHE.get(cache_key)
     if cached:
         return cached
-    txt = None
     try:
-        txt = analyze.read_save(path)
-        meta_info = analyze.meta(txt)
-        countries = analyze.parse_countries(txt)
-        player_id = analyze.player_country_id(txt, countries, str(meta_info["country"]))
-        identity = analyze.save_identity(meta_info, countries, player_id)
+        text = read_save_preview_text(path)
+        filename_country, filename_date = filename_save_hint(path)
+        raw_date = preview_value(text, "game_date") or preview_value(text, "date")
+        raw_country = preview_value(text, "name") or filename_country or analyze.safe_filename_part(path.stem, "未知国家")
+        country = analyze.country_names.display_name(raw_country, analyze.COUNTRY_NAMES)
+        version = preview_value(text, "version") or "未知版本"
+        rank = preview_value(text, "rank") or "未知地位"
         preview = {
             "path": path,
-            "country": identity["country"],
-            "date": identity["date"],
+            "country": country,
+            "date": analyze.normalize_game_date(raw_date) if raw_date else filename_date or "未知日期",
+            "version": version,
+            "rank": rank,
+            "size": file_size_label(stat.st_size),
+            "source": save_source_label(path),
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
             "status": "可读",
         }
@@ -355,14 +299,15 @@ def save_preview(path: Path) -> dict:
             "path": path,
             "country": "读取失败",
             "date": "未知日期",
+            "version": "未知版本",
+            "rank": "未知地位",
+            "size": file_size_label(stat.st_size),
+            "source": save_source_label(path),
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
             "status": str(exc)[:40],
         }
         SAVE_PREVIEW_CACHE[cache_key] = preview
         return preview
-    finally:
-        if txt is not None:
-            analyze.clear_database_block_cache(txt)
 
 
 def choose_save_path() -> Path | None:
@@ -371,19 +316,7 @@ def choose_save_path() -> Path | None:
         print("没有找到 Victoria 3 存档。")
         return None
 
-    print("\n正在扫描存档列表，只读取国家和游戏日期...")
-    previews = []
-    for index, path in enumerate(saves, 1):
-        text = f"扫描存档 {index}/{len(saves)}，剩 {len(saves) - index} 个：{path.name}"
-        print("\r" + text + " " * 30, end="", flush=True)
-        previews.append(save_preview(path))
-    print()
-
-    line("选择要导出的存档")
-    for index, item in enumerate(previews, 1):
-        latest = " 最新" if index == 1 else ""
-        print(f"[{index}] {item['country']} | {item['date']} | {item['modified']} | {item['path'].name}{latest}")
-    print("[0] 返回")
+    previews = render_save_picker(saves, multi=False)
 
     choice = ask("\n选择：").strip()
     if not choice or choice == "0":
@@ -392,6 +325,62 @@ def choose_save_path() -> Path | None:
         print("选择无效。")
         return None
     return previews[int(choice) - 1]["path"]
+
+
+def render_save_picker(saves: list[Path], multi: bool = False) -> list[dict]:
+    print("\n正在读取存档列表...")
+    previews = [save_preview(path) for path in saves]
+    line(f"存档列表（{len(previews)} 个）")
+    for index, item in enumerate(previews, 1):
+        latest = "  最新" if index == 1 else ""
+        print(f"{index:>2}. {item['country']}  {item['date']}  {item['source']}  {item['size']}  {item['path'].name}{latest}")
+    print(" 0. 返回")
+    if multi:
+        print("\n可多选：1,3,5 或 2-6")
+    return previews
+
+
+def parse_selection(raw: str, total: int) -> list[int]:
+    indexes: list[int] = []
+    seen: set[int] = set()
+    for part in re.split(r"[,\s，、]+", raw.strip()):
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            if not start_raw.isdigit() or not end_raw.isdigit():
+                continue
+            start, end = int(start_raw), int(end_raw)
+            if start > end:
+                start, end = end, start
+            candidates = range(start, end + 1)
+        elif part.isdigit():
+            candidates = [int(part)]
+        else:
+            continue
+        for index in candidates:
+            if 1 <= index <= total and index not in seen:
+                indexes.append(index)
+                seen.add(index)
+    return indexes
+
+
+def choose_save_paths_multi() -> list[Path]:
+    saves = list_save_paths()
+    if not saves:
+        print("没有找到 Victoria 3 存档。")
+        return []
+
+    previews = render_save_picker(saves, multi=True)
+
+    choice = ask("选择：").strip()
+    if not choice or choice == "0":
+        return []
+    indexes = parse_selection(choice, len(previews))
+    if not indexes:
+        print("选择无效。")
+        return []
+    return [previews[index - 1]["path"] for index in indexes]
 
 
 def normalize_chat_endpoint(config: dict) -> str:
@@ -408,21 +397,64 @@ def unique_directory(path: Path) -> Path:
     if not path.exists():
         return path
     for index in range(2, 1000):
-        candidate = path.with_name(f"{path.name}_第{index}次导出")
+        if path.suffix:
+            candidate = path.with_name(f"{path.stem}_第{index}次导出{path.suffix}")
+        else:
+            candidate = path.with_name(f"{path.name}_第{index}次导出")
         if not candidate.exists():
             return candidate
+    if path.suffix:
+        return path.with_name(f"{path.stem}_{datetime.now().strftime('%H%M%S')}{path.suffix}")
     return path.with_name(f"{path.name}_{datetime.now().strftime('%H%M%S')}")
 
 
-def prepare_desktop_output(path: Path, txt: str) -> Path:
+def prepare_export_output(path: Path, txt: str) -> Path:
     meta_info = analyze.meta(txt)
     countries = analyze.parse_countries(txt)
     player_id = analyze.player_country_id(txt, countries, str(meta_info["country"]))
     identity = analyze.save_identity(meta_info, countries, player_id)
-    run_dir = unique_directory(DESKTOP_REPORT_ROOT / identity["label"])
+    run_dir = unique_directory(EXPORT_ROOT / identity["label"])
     run_dir.mkdir(parents=True, exist_ok=True)
     analyze.REPORT_DIR = run_dir
     return run_dir
+
+
+def desktop_md_label(path: Path) -> str:
+    preview = save_preview(path)
+    country = analyze.safe_filename_part(preview.get("country"), "未知国家")
+    date = analyze.safe_filename_part(preview.get("date"), "未知日期")
+    return f"{country}_{date}"
+
+
+def prepare_desktop_md_output(path: Path) -> Path:
+    DESKTOP_MD_ROOT.mkdir(parents=True, exist_ok=True)
+    analyze.REPORT_DIR = DESKTOP_MD_ROOT
+    return DESKTOP_MD_ROOT
+
+
+def clean_desktop_md_temp_files() -> None:
+    md_library.clean_temp_files(DESKTOP_MD_ROOT)
+
+
+def write_desktop_md_index() -> Path:
+    return md_library.write_index(DESKTOP_MD_ROOT)
+
+
+def keep_only_md_report(run_dir: Path, document: Path, path: Path, outputs: dict[str, Path]) -> Path:
+    stem = document.name
+    if stem.endswith("_systems_document.md"):
+        stem = stem[: -len("_systems_document.md")]
+    else:
+        stem = desktop_md_label(path)
+    final_report = md_library.copy_report_to_library(document, run_dir, f"{stem}_体系化国家报告.md")
+    generated = {Path(item).resolve() for item in outputs.values()}
+    generated.add(document.resolve())
+    for item in generated:
+        if item != final_report.resolve() and item.exists() and item.is_file():
+            item.unlink()
+    clean_desktop_md_temp_files()
+    write_desktop_md_index()
+    return final_report
 
 
 def copy_to_category(path: Path, target_dir: Path) -> None:
@@ -484,26 +516,25 @@ def categorize_run_outputs(run_dir: Path, quick_report: Path | None, quick_outpu
 
 def print_combined_summary(started: float, run_dir: Path, quick_report: Path, quick_outputs: dict[str, Path], document: Path, outputs: dict[str, Path]) -> None:
     elapsed = ProgressPrinter._clock(time.time() - started)
-    print("\n结论：一键导出完成。")
-    print(f"总耗时：{elapsed}")
-    print("最后一步：复制全部报告和表格到桌面分类目录。")
-    print(f"输出目录：{run_dir}")
-    print(f"主报告：{document}")
-    print(f"表格索引：{outputs['systems_report']}")
-    print(f"快速报告：{quick_report}")
-    print(f"总索引 JSON：{outputs['systems_summary']}")
-    print(f"建议先打开：{run_dir / '01_总览索引'}")
+    terminal_ui.done(
+        [
+            ("耗时", elapsed),
+            ("文件夹", run_dir),
+            ("主报告", document),
+            ("表格索引", outputs["systems_report"]),
+        ]
+    )
 
 
 def run_combined_export(path: Path | None = None) -> None:
     latest_mode = path is None
-    print("\n正在导出：快速报告 + 体系化国家文档...")
+    print("\n导出中")
     if latest_mode:
         path = analyze.find_latest_save()
     if not path:
         print("没有找到 Victoria 3 存档。")
         return
-    progress = ProgressPrinter(total_hint_seconds=240, steps=COMBINED_EXPORT_STEPS)
+    progress = ProgressPrinter(total_hint_seconds=240, steps=COMBINED_EXPORT_STEPS, title="完整导出")
     progress.start()
     txt = None
     try:
@@ -511,8 +542,8 @@ def run_combined_export(path: Path | None = None) -> None:
         progress(5, "读取并展开存档")
         txt = analyze.read_save(path)
         progress(18, "存档读取完成")
-        run_dir = prepare_desktop_output(path, txt)
-        progress(20, "创建桌面分类目录")
+        run_dir = prepare_export_output(path, txt)
+        progress(20, "创建分类目录")
         progress(21, "生成快速报告")
         quick_report, quick_outputs = analyze.build_report(path, txt, full_pops=False)
         progress(28, "快速报告完成")
@@ -523,23 +554,157 @@ def run_combined_export(path: Path | None = None) -> None:
             full_pops=True,
             progress=lambda p, label: progress(28 + int(p * 0.68), label),
         )
-        progress(97, "复制到桌面分类目录")
+        progress(97, "复制到分类目录")
         categorize_run_outputs(run_dir, quick_report, quick_outputs, outputs)
         progress(100, "分类复制完成")
     except Exception as exc:
         progress.stop()
-        print(f"\n导出失败：{exc}")
+        terminal_ui.failed(exc)
         return
     finally:
         if txt is not None:
             analyze.clear_database_block_cache(txt)
     progress.stop()
     print_combined_summary(progress.started, run_dir, quick_report, quick_outputs, document, outputs)
+    terminal_ui.open_folder(run_dir)
+
+
+def print_md_only_summary(started: float, run_dir: Path, report: Path) -> None:
+    elapsed = ProgressPrinter._clock(time.time() - started)
+    terminal_ui.done([("耗时", elapsed), ("文件夹", run_dir), ("MD报告", report)])
+
+
+def print_cached_md_summary(started: float, report: Path) -> None:
+    elapsed = ProgressPrinter._clock(time.time() - started)
+    terminal_ui.done([("耗时", elapsed), ("状态", "存档未变化，已复用资料库报告"), ("文件夹", DESKTOP_MD_ROOT), ("MD报告", report)])
+
+
+def existing_valid_md_report_for_save(path: Path) -> Path | None:
+    preview = save_preview(path)
+    country = analyze.safe_filename_part(preview.get("country"), "未知国家")
+    date = analyze.safe_filename_part(preview.get("date"), "未知日期")
+    if date in {"未知日期", "DATE_UNKNOWN"}:
+        return None
+    prefix = f"{country}_{date}_体系化国家报告"
+    candidates = sorted(DESKTOP_MD_ROOT.glob(f"{prefix}*.md"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for report in candidates:
+        if not md_library.validate_report(report):
+            md_library.remember_report(path, report, MD_CACHE_ROOT)
+            return report
+    return None
+
+
+def run_desktop_md_export(path: Path | None = None, open_folder: bool = True, quiet_summary: bool = False) -> Path | None:
+    latest_mode = path is None
+    print("\n导出全量 MD 数据文档")
+    started = time.time()
+    if latest_mode:
+        path = analyze.find_latest_save()
+    if not path:
+        print("没有找到 Victoria 3 存档。")
+        return None
+    DESKTOP_MD_ROOT.mkdir(parents=True, exist_ok=True)
+    cached = md_library.cached_report_for_save(path, DESKTOP_MD_ROOT, MD_CACHE_ROOT)
+    if cached:
+        clean_desktop_md_temp_files()
+        write_desktop_md_index()
+        if quiet_summary:
+            print(f"完成：{cached.name}（缓存）")
+        else:
+            print_cached_md_summary(started, cached)
+        if open_folder:
+            terminal_ui.open_folder(DESKTOP_MD_ROOT)
+        return cached
+    progress = ProgressPrinter(total_hint_seconds=240, steps=COMBINED_EXPORT_STEPS, title="MD导出")
+    progress.start()
+    txt = None
     try:
-        os.startfile(document)
-        os.startfile(run_dir)
-    except OSError:
-        pass
+        progress(1, "找到最新存档" if latest_mode else f"已选择存档：{path.name}")
+        progress(5, "读取并展开存档")
+        txt = analyze.read_save(path)
+        progress(18, "存档读取完成")
+        run_dir = prepare_desktop_md_output(path)
+        progress(20, "创建桌面文件夹")
+        document, outputs = analyze.build_system_export(
+            path,
+            txt,
+            limit=0,
+            full_pops=True,
+            progress=lambda p, label: progress(20 + int(p * 0.76), label),
+        )
+        progress(97, "整理单个MD报告")
+        report = keep_only_md_report(run_dir, document, path, outputs)
+        md_library.remember_report(path, report, MD_CACHE_ROOT)
+        issues = md_library.validate_report(report)
+        if issues:
+            print("\n自检提醒：" + "；".join(issues))
+        progress(100, "完成")
+    except Exception as exc:
+        progress.stop()
+        terminal_ui.failed(exc)
+        return None
+    finally:
+        if txt is not None:
+            analyze.clear_database_block_cache(txt)
+    progress.stop()
+    if quiet_summary:
+        elapsed = ProgressPrinter._clock(time.time() - started)
+        print(f"完成：{report.name}（{elapsed}）")
+    else:
+        print_md_only_summary(progress.started, run_dir, report)
+    if open_folder:
+        terminal_ui.open_folder(run_dir)
+    return report
+
+
+def run_desktop_md_batch(paths: list[Path]) -> None:
+    if not paths:
+        return
+    started = time.time()
+    print(f"\n批量导出 MD：{len(paths)} 个存档")
+    completed: list[Path] = []
+    failed: list[tuple[Path, str]] = []
+    for index, path in enumerate(paths, 1):
+        print(f"\n[{index}/{len(paths)}] {path.name}")
+        report = run_desktop_md_export(path, open_folder=False, quiet_summary=True)
+        if report:
+            completed.append(report)
+        else:
+            failed.append((path, "导出失败"))
+    elapsed = ProgressPrinter._clock(time.time() - started)
+    print("\n批量完成")
+    print(f"耗时：{elapsed}")
+    print(f"成功：{len(completed)}")
+    print(f"失败：{len(failed)}")
+    print(f"位置：{DESKTOP_MD_ROOT}")
+    terminal_ui.open_folder(DESKTOP_MD_ROOT)
+
+
+def desktop_md_menu() -> None:
+    while True:
+        choice = terminal_ui.menu(
+            f"Victoria 3 存档读取器 v{APP_VERSION}",
+            [("1", "导出最新存档为单个 MD"), ("2", "选择多个存档批量导出 MD"), ("3", "导出全部存档 MD"), ("0", "返回")],
+            subtitle="MD 资料库",
+            footer=f"输出位置：{DESKTOP_MD_ROOT}",
+        )
+        if not choice or choice == "0":
+            return
+        if choice == "1":
+            run_desktop_md_export()
+            pause()
+        elif choice == "2":
+            selected = choose_save_paths_multi()
+            if selected:
+                run_desktop_md_batch(selected)
+            pause()
+        elif choice == "3":
+            paths = list_save_paths()
+            if paths:
+                run_desktop_md_batch(paths)
+            else:
+                print("没有找到 Victoria 3 存档。")
+            pause()
 
 
 def read_limited(path: Path, max_chars: int) -> str:
@@ -647,17 +812,16 @@ def call_chat_api(config: dict, content: str) -> str:
 
 def print_api_summary(started: float, run_dir: Path, out: Path, document: Path, outputs: dict[str, Path]) -> None:
     elapsed = ProgressPrinter._clock(time.time() - started)
-    print("\n结论：API 深度报表完成。")
-    print(f"总耗时：{elapsed}")
-    print("最后一步：保存 API 报表并复制到总览索引目录。")
-    print(f"输出目录：{run_dir}")
+    print("\n完成")
+    print(f"耗时：{elapsed}")
+    print(f"文件夹：{run_dir}")
     print(f"API 报表：{out}")
-    print(f"本地体系主报告：{document}")
+    print(f"本地报告：{document}")
     print(f"表格索引：{outputs['systems_report']}")
 
 
 def run_api_analysis(config: dict, path: Path | None = None) -> None:
-    print("\n正在生成本地分类数据并准备 API 报表，大存档可能需要几分钟...")
+    print("\nAPI 报表")
     if path is None:
         path = analyze.find_latest_save()
     if not path:
@@ -672,8 +836,8 @@ def run_api_analysis(config: dict, path: Path | None = None) -> None:
         progress(5, "读取并展开存档")
         txt = analyze.read_save(path)
         progress(18, "存档读取完成")
-        run_dir = prepare_desktop_output(path, txt)
-        progress(20, "创建桌面分类目录")
+        run_dir = prepare_export_output(path, txt)
+        progress(20, "创建分类目录")
         document, outputs = analyze.build_system_export(
             path,
             txt,
@@ -681,18 +845,18 @@ def run_api_analysis(config: dict, path: Path | None = None) -> None:
             full_pops=True,
             progress=lambda p, label: progress(18 + int(p * 0.55), label),
         )
-        progress(73, "复制到桌面分类目录")
+        progress(73, "复制到分类目录")
         categorize_run_outputs(run_dir, None, {}, outputs)
         progress(75, "本地体系数据已分类")
     except Exception as exc:
         progress.stop()
-        print(f"\n本地体系数据生成失败：{exc}")
+        print(f"\n失败：{exc}")
         return
     finally:
         if txt is not None:
             analyze.clear_database_block_cache(txt)
     progress.stop()
-    print("正在调用 API 生成分类报表...")
+    print("调用 API")
     api_content = compact_system_bundle_for_api(document, outputs)
     api_progress = ProgressPrinter(total_hint_seconds=90, steps=API_EXPORT_STEPS)
     api_progress.start()
@@ -712,7 +876,7 @@ def run_api_analysis(config: dict, path: Path | None = None) -> None:
     api_progress.stop()
     print_api_summary(total_started, run_dir, out, document, outputs)
     try:
-        os.startfile(out)
+        os.startfile(run_dir)
     except OSError:
         pass
 
@@ -750,30 +914,117 @@ def api_menu() -> None:
             return
 
 
-def main() -> None:
+def run_local_data_api() -> None:
+    terminal_ui.section("本地数据 API")
+    print("主地址：http://127.0.0.1:8765")
+    print("给工具读取：http://127.0.0.1:8765/api/package?dataset=latest")
+    print("SQL 示例：http://127.0.0.1:8765/api/sql/table/major_countries?dataset=latest&limit=20")
+    print(f"数据仓库：{DATA_CACHE_ROOT}")
+    print("按 Ctrl+C 停止")
+    script = Path(__file__).with_name("api_server.py")
+    try:
+        subprocess.run([sys.executable, str(script), "serve"])
+    except KeyboardInterrupt:
+        print("\n已停止")
+
+
+def run_public_data_api() -> None:
+    print("\n公网数据 API")
+    print("会生成一个带密钥的 HTTPS 地址。窗口不要关，关了公网地址就失效。")
+    script = Path(__file__).with_name("public_api.py")
+    try:
+        subprocess.run([sys.executable, str(script)])
+    except KeyboardInterrupt:
+        print("\n已停止")
+
+
+def run_data_api_command(*args: str) -> None:
+    script = Path(__file__).with_name("api_server.py")
+    subprocess.run([sys.executable, str(script), *args])
+
+
+def data_api_menu() -> None:
     while True:
-        clear()
-        config = load_config()
-        line(f"Victoria 3 存档读取器 v{APP_VERSION}")
-        print(f"API：{saved_label(config)}")
-        print()
-        print("[1] 选择存档导出")
-        print("[2] 直接导出最新存档")
-        print("[3] API 深度报表")
-        print("[0] 退出")
-        choice = ask("\n选择：").strip()
-        if not choice:
-            sys.exit(0)
+        choice = terminal_ui.menu(
+            f"Victoria 3 存档读取器 v{APP_VERSION}",
+            [("1", "为最新存档建库"), ("2", "选择存档建库"), ("3", "查看已有数据包"), ("4", "启动本地 API"), ("5", "启动公网 API"), ("0", "返回")],
+            subtitle="数据 API",
+            footer=f"数据仓库：{DATA_CACHE_ROOT}",
+        )
+        if not choice or choice == "0":
+            return
         if choice == "1":
+            run_data_api_command("build", "--save", "latest")
+            pause()
+        elif choice == "2":
+            selected = choose_save_path()
+            if selected:
+                run_data_api_command("build", "--save", str(selected))
+            pause()
+        elif choice == "3":
+            run_data_api_command("list")
+            pause()
+        elif choice == "4":
+            run_local_data_api()
+            pause()
+        elif choice == "5":
+            run_public_data_api()
+            pause()
+
+
+def full_export_menu() -> None:
+    while True:
+        choice = terminal_ui.menu(
+            f"Victoria 3 存档读取器 v{APP_VERSION}",
+            [("1", "导出最新存档完整资料"), ("2", "选择一个存档完整导出"), ("0", "返回")],
+            subtitle="完整导出",
+            footer=f"输出位置：{EXPORT_ROOT}",
+        )
+        if not choice or choice == "0":
+            return
+        if choice == "1":
+            run_combined_export()
+            pause()
+        elif choice == "2":
             selected = choose_save_path()
             if selected:
                 run_combined_export(selected)
-                pause()
-        elif choice == "2":
-            run_combined_export()
             pause()
-        elif choice == "3":
+
+
+def ai_api_menu() -> None:
+    while True:
+        choice = terminal_ui.menu(
+            f"Victoria 3 存档读取器 v{APP_VERSION}",
+            [("1", "生成 API 深度报表"), ("2", "管理本地/公网数据 API"), ("0", "返回")],
+            subtitle="AI / API",
+            footer=f"API：{saved_label(load_config())}",
+        )
+        if not choice or choice == "0":
+            return
+        if choice == "1":
             api_menu()
+        elif choice == "2":
+            data_api_menu()
+
+
+def main() -> None:
+    while True:
+        config = load_config()
+        choice = terminal_ui.menu(
+            f"Victoria 3 存档读取器 v{APP_VERSION}",
+            [("1", "MD 资料库"), ("2", "完整导出"), ("3", "AI / API"), ("0", "退出")],
+            subtitle="选择你要做的事",
+            footer=f"MD库：{DESKTOP_MD_ROOT}\nAPI：{saved_label(config)}",
+        )
+        if not choice:
+            sys.exit(0)
+        if choice == "1":
+            desktop_md_menu()
+        elif choice == "2":
+            full_export_menu()
+        elif choice == "3":
+            ai_api_menu()
         elif choice == "0":
             sys.exit(0)
 
