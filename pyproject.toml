@@ -1,6 +1,6 @@
 [project]
 name = "vic3-save-analyzer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Victoria 3 save parser and report exporter for economy, population, diplomacy, wars, companies, and social structure."
 readme = "README.md"
 requires-python = ">=3.10"

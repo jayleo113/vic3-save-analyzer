@@ -54,7 +54,8 @@ def filename_date_tuple(path: Path) -> tuple[int, int, int]:
 
 def quick_save_game_date_tuple(path: Path) -> tuple[int, int, int]:
     try:
-        raw = path.read_bytes()[:512_000]
+        with path.open('rb') as handle:
+            raw = handle.read(512_000)
         if raw.startswith(b"PK"):
             with zipfile.ZipFile(path) as zf:
                 names = zf.namelist()

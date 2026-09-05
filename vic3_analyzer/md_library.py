@@ -13,11 +13,16 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+from . import country_names
+from .cache_io import atomic_json, cache_lock
+from .fingerprint import full_hash
+from .snapshot_store import code_version
 
 
 INDEX_NAME = "00_资料库索引.md"
 MANIFEST_NAME = "md_library_manifest.json"
-SCHEMA_VERSION = "md_full_v4"
+SCHEMA_VERSION = "md_full_v5_verified_world"
+ARCHIVE_DIR_NAME = "_旧版重复报告"
 
 
 def file_size_label(size: int) -> str:
@@ -36,6 +41,7 @@ def save_fingerprint(path: Path) -> dict[str, object]:
         "path": str(path.resolve()),
         "mtime": stat.st_mtime,
         "size": stat.st_size,
+        "sha256": full_hash(path),
     }
 
 
@@ -56,36 +62,66 @@ def load_manifest(cache_root: Path) -> dict[str, object]:
 def save_manifest(cache_root: Path, manifest: dict[str, object]) -> Path:
     cache_root.mkdir(parents=True, exist_ok=True)
     path = cache_root / MANIFEST_NAME
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_json(path, manifest)
     return path
 
 
 def cached_report_for_save(save_path: Path, library_root: Path, cache_root: Path) -> Path | None:
     manifest = load_manifest(cache_root)
+    changed = False
     entry = manifest.get("reports", {}).get(str(save_path.resolve()))
     if not isinstance(entry, dict):
         return None
     current = save_fingerprint(save_path)
     if entry.get("mtime") != current["mtime"] or entry.get("size") != current["size"]:
         return None
+    if entry.get('sha256') != current['sha256']:
+        return None
     if entry.get("schema") != SCHEMA_VERSION:
+        return None
+    if entry.get('parser_version') != code_version(Path(__file__).resolve().parents[1]):
         return None
     report_name = str(entry.get("report") or "")
     report = library_root / report_name
-    return report if report.is_file() else None
+    expected = entry.get('report_sha256')
+    if report.is_file() and full_hash(report) == expected:
+        return report
+    organize_library(library_root)
+    for candidate in library_root.glob("*.md"):
+        if candidate.name == INDEX_NAME:
+            continue
+        try:
+            if full_hash(candidate) == expected:
+                entry["report"] = candidate.name
+                changed = True
+                if changed:
+                    save_manifest(cache_root, manifest)
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
-def remember_report(save_path: Path, report: Path, cache_root: Path) -> None:
+def remember_report(save_path: Path, report: Path, cache_root: Path, expected_hash: str | None = None) -> None:
+    with cache_lock(cache_root / 'md_library.lock'):
+        _remember_report(save_path, report, cache_root, expected_hash)
+
+
+def _remember_report(save_path: Path, report: Path, cache_root: Path, expected_hash: str | None):
     manifest = load_manifest(cache_root)
     reports = manifest.setdefault("reports", {})
     if not isinstance(reports, dict):
         reports = {}
         manifest["reports"] = reports
     fingerprint = save_fingerprint(save_path)
+    if expected_hash and fingerprint['sha256'] != expected_hash:
+        raise RuntimeError('存档已变化，未缓存旧报告，请重试')
     reports[str(save_path.resolve())] = {
         **fingerprint,
         "schema": SCHEMA_VERSION,
+        "parser_version": code_version(Path(__file__).resolve().parents[1]),
         "report": report.name,
+        "report_sha256": full_hash(report),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     save_manifest(cache_root, manifest)
@@ -120,36 +156,124 @@ def normalize_legacy_names(library_root: Path) -> None:
             item.rename(fixed)
 
 
+def canonical_report_name(country: object, date: object) -> str:
+    country_part = re.sub(r'[<>:"/\\|?*\r\n\t]+', "_", str(country or "未知国家")).strip(" ._") or "未知国家"
+    date_part = re.sub(r"[^\d-]+", "_", str(date or "未知日期")).strip(" ._") or "未知日期"
+    return f"{country_part}_{date_part}_国家报告.md"
+
+
+def _date_from_text(text: str) -> str:
+    match = re.search(r"游戏日期[：:]\s*(\d{4})[.-](\d{1,2})[.-](\d{1,2})", text[:2000])
+    if not match:
+        return ""
+    year, month, day = [int(part) for part in match.groups()]
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _country_from_text(text: str) -> str:
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or cells[0] in {"序", "---", ""}:
+            continue
+        country = cells[1]
+        if country and country not in {"国家", "---"}:
+            country = re.sub(r"\s*\([A-Z0-9_]{2,}\)\s*$", "", country).strip()
+            if re.fullmatch(r"[A-Z]{2,4}", country):
+                return country_names.display_name(country)
+            return country
+    return ""
+
+
+def report_identity_from_content(report: Path) -> tuple[str, str]:
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", ""
+    return _country_from_text(text), _date_from_text(text)
+
+
 def report_identity(report: Path) -> tuple[str, str]:
-    pattern = re.compile(r"(.+?)_(\d{4}-\d{2}-\d{2})_体系化国家报告(?:_第\d+次导出)?\.md$")
+    pattern = re.compile(r"(.+?)_(\d{4}-\d{2}-\d{2})_(?:体系化国家报告|国家报告)(?:_第\d+次导出)?\.md$")
     match = pattern.match(report.name)
     if match:
-        return match.group(1), match.group(2)
+        country = match.group(1)
+        content_country, content_date = ("", "")
+        if re.fullmatch(r"[A-Z]{2,4}", country) or not re.search(r"[\u4e00-\u9fff]", country):
+            content_country, content_date = report_identity_from_content(report)
+        if re.fullmatch(r"[A-Z]{2,4}", country) or (content_country and not re.search(r"[\u4e00-\u9fff]", country)):
+            return content_country or country, content_date or match.group(2)
+        return country, match.group(2)
+    content_country, content_date = report_identity_from_content(report)
+    if content_country and content_date:
+        return content_country, content_date
     return "未知", "未知"
+
+
+def organize_library(library_root: Path) -> dict[str, int]:
+    library_root.mkdir(parents=True, exist_ok=True)
+    normalize_legacy_names(library_root)
+    archive = library_root / ARCHIVE_DIR_NAME
+    renamed = 0
+    archived = 0
+    by_identity: dict[tuple[str, str], list[Path]] = {}
+    for report in library_root.glob("*.md"):
+        if report.name == INDEX_NAME:
+            continue
+        country, date = report_identity(report)
+        if country == "未知" or date == "未知":
+            continue
+        by_identity.setdefault((country, date), []).append(report)
+    for (country, date), reports in by_identity.items():
+        canonical = library_root / canonical_report_name(country, date)
+        keep = max(reports, key=lambda item: item.stat().st_mtime)
+        archive.mkdir(parents=True, exist_ok=True)
+        for report in reports:
+            if report == keep:
+                continue
+            target = archive / report.name
+            if target.exists():
+                target = archive / f"{report.stem}_{datetime.fromtimestamp(report.stat().st_mtime).strftime('%Y%m%d%H%M%S')}{report.suffix}"
+            report.rename(target)
+            archived += 1
+        if keep.name != canonical.name:
+            if canonical.exists():
+                target = archive / f"{canonical.stem}_{datetime.fromtimestamp(canonical.stat().st_mtime).strftime('%Y%m%d%H%M%S')}{canonical.suffix}"
+                canonical.rename(target)
+                archived += 1
+            keep.rename(canonical)
+            renamed += 1
+    return {"renamed": renamed, "archived": archived}
 
 
 def write_index(library_root: Path) -> Path:
     library_root.mkdir(parents=True, exist_ok=True)
-    normalize_legacy_names(library_root)
+    organize_library(library_root)
     reports = sorted(
         [item for item in library_root.glob("*.md") if item.name != INDEX_NAME],
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
+        key=lambda item: (report_identity(item)[0], report_identity(item)[1]),
     )
+    by_country: dict[str, list[Path]] = {}
+    for report in reports:
+        country, _date = report_identity(report)
+        by_country.setdefault(country, []).append(report)
     lines = [
         "# Victoria 3 存档 MD 资料库",
         "",
         f"- 更新时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"- 报告数量：{len(reports)}",
+        f"- 重复旧报告归档：`{ARCHIVE_DIR_NAME}`",
         "- 用途：给不能访问本地 API 的聊天环境直接读取。这里尽量只放 Markdown 报告，不放 CSV/JSON 表格。",
         "",
-        "| 序 | 国家 | 游戏日期 | 文件 | 修改时间 | 大小 |",
-        "|---:|---|---|---|---|---:|",
     ]
-    for index, report in enumerate(reports, 1):
-        country, date = report_identity(report)
-        modified = datetime.fromtimestamp(report.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"| {index} | {country} | {date} | `{report.name}` | {modified} | {file_size_label(report.stat().st_size)} |")
+    for country in sorted(by_country):
+        country_reports = sorted(by_country[country], key=lambda item: report_identity(item)[1], reverse=True)
+        lines.extend(["", f"## {country}", "", "| 游戏日期 | 文件 | 修改时间 | 大小 |", "|---|---|---|---:|"])
+        for report in country_reports:
+            _country, date = report_identity(report)
+            modified = datetime.fromtimestamp(report.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"| {date} | `{report.name}` | {modified} | {file_size_label(report.stat().st_size)} |")
     index_path = library_root / INDEX_NAME
     index_path.write_text("\n".join(lines), encoding="utf-8")
     return index_path
@@ -185,13 +309,15 @@ def copy_report_to_library(document: Path, library_root: Path, final_name: str) 
     library_root.mkdir(parents=True, exist_ok=True)
     final_report = library_root / final_name
     if final_report.exists():
-        stem = final_report.stem
-        suffix = final_report.suffix
-        for index in range(2, 1000):
-            candidate = library_root / f"{stem}_第{index}次导出{suffix}"
-            if not candidate.exists():
-                final_report = candidate
-                break
+        try:
+            if full_hash(document) == full_hash(final_report):
+                return final_report
+        except OSError:
+            pass
+        archive = library_root / ARCHIVE_DIR_NAME
+        archive.mkdir(parents=True, exist_ok=True)
+        archived = archive / f"{final_report.stem}_{datetime.fromtimestamp(final_report.stat().st_mtime).strftime('%Y%m%d%H%M%S')}{final_report.suffix}"
+        final_report.rename(archived)
     if document.resolve() != final_report.resolve():
         shutil.copy2(document, final_report)
     return final_report

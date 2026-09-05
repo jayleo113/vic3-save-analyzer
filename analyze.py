@@ -21,7 +21,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from vic3_analyzer import buildings, country_names, diplomacy, formatting, metrics, parser_core, pops, save_discovery, save_reader, states
+from vic3_analyzer import buildings, country_names, diplomacy, external_tools, formatting, metrics, parser_core, pops, save_discovery, save_reader, states, world_data
 
 
 SAVE_DIR = Path.home() / "Documents" / "Paradox Interactive" / "Victoria 3" / "save games"
@@ -185,7 +185,7 @@ def looks_like_text_save(data: bytes) -> bool:
 
 
 def melt_save_with_garibaldi(path: Path, out: Path | None = None) -> Path:
-    return save_reader.melt_save_with_garibaldi(path, COMMUNITY_DIR, out)
+    return save_reader.melt_save_with_garibaldi(path, COMMUNITY_DIR, out, TOOL_DIR / "data_cache")
 
 
 def community_status() -> dict[str, object]:
@@ -207,13 +207,14 @@ def community_status() -> dict[str, object]:
     return {
         "community_dir": str(COMMUNITY_DIR),
         "sources": sources,
+        "accelerators": external_tools.status(TOOL_DIR),
         "rakaly_melter": str(melter) if melter else None,
         "rakaly_melter_available": melter is not None,
     }
 
 
 def read_save(path: Path) -> str:
-    return save_reader.read_save(path, COMMUNITY_DIR)
+    return save_reader.read_save(path, COMMUNITY_DIR, TOOL_DIR, TOOL_DIR / "data_cache")
 
 
 def save_kind(path: Path) -> str:
@@ -1667,59 +1668,26 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     mark(5, "读取存档元数据")
     meta_info = meta(txt)
-    countries = parse_countries(txt)
+    countries, rankings, all_states, world_rows, extraction = world_data.collect(sys.modules[__name__], txt, full_pops, mark)
     player_id = player_country_id(txt, countries, str(meta_info["country"]))
     stem = save_output_stem(path, meta_info, countries, player_id, "_systems")
-    rankings = parse_rankings(txt, countries)
     major_ids = select_major_country_ids(countries, rankings, player_id, limit)
     major_set = set(major_ids)
-    mark(12, "整理主要国家")
-    all_states, state_to_country = parse_all_states(txt, countries)
     major_states = [row for row in all_states if row["country_id"] in major_set]
-    mark(20, "整理州、基建、破坏度")
-    building_details, building_summary = parse_buildings_for_countries(txt, state_to_country, countries, major_set)
-    mark(30, "整理建筑和经济部门")
-    culture_map = parse_culture_map(txt) if full_pops else {}
-    if full_pops:
-        pop_summary, pop_by_type, pop_by_culture, pop_by_religion = parse_pops_for_countries(
-            txt,
-            state_to_country,
-            countries,
-            major_set,
-            culture_map,
-            progress=lambda p, label: mark(30 + int(p * 0.28), label),
-        )
-    else:
-        pop_summary, pop_by_type, pop_by_culture, pop_by_religion = [], [], [], []
-    mark(58, "整理人口、职业、文化、宗教")
-    law_rows = parse_laws_for_countries(txt, countries, major_set)
-    ig_rows = parse_interest_groups_for_countries(txt, countries, major_set)
-    tech_rows = parse_technology_for_countries(txt, countries, major_set)
-    mark(68, "整理制度、利益集团、科技")
-    relation_rows = parse_relations_for_countries(txt, countries, major_set)
-    mark(70, "整理外交关系")
-    pact_rows = parse_pacts_for_countries(txt, countries, major_set)
-    subject_rows = parse_subject_relations(pact_rows, countries)
-    treaty_rows, treaty_article_rows = parse_treaties_for_countries(txt, countries, major_set)
-    mark(72, "整理外交条约与正式条款")
-    market_rows, market_member_rows, market_state_rows, market_trade_goods_rows = parse_market_data(txt, countries, all_states)
-    mark(73, "整理市场、成员国、州级贸易")
-    company_rows = parse_companies_for_countries(txt, countries, major_set)
-    political_movement_rows = parse_political_movements_for_countries(txt, countries, major_set)
-    mark(74, "整理公司、GDP占比、政治运动")
-    war_rows, war_participant_rows = parse_wars_for_countries(txt, countries, major_set)
-    mark(76, "整理战争与参战方")
-    diplomatic_play_rows, war_cost_rows = parse_diplomatic_plays_for_countries(txt, countries, major_set)
-    war_goal_rows = parse_war_goals_for_countries(txt, countries, major_set)
-    military_formation_rows = parse_military_formations_for_countries(txt, countries, major_set)
-    mark(79, "整理外交博弈、战争目标、军队")
-    battle_rows, battle_casualty_rows = parse_battles_for_countries(
-        txt,
-        countries,
-        major_set,
-        culture_map,
-        progress=lambda p, label: mark(79 + int(p * 0.03), label),
-    )
+    selected = world_data.select(world_rows, major_set, countries, sys.modules[__name__])
+    building_details, building_summary = selected['building_details'], selected['building_summary']
+    pop_summary, pop_by_type = selected['pop_summary'], selected['pop_by_type']
+    pop_by_culture, pop_by_religion = selected['pop_by_culture'], selected['pop_by_religion']
+    law_rows, ig_rows, tech_rows = selected['law_rows'], selected['ig_rows'], selected['tech_rows']
+    relation_rows, pact_rows, subject_rows = selected['relation_rows'], selected['pact_rows'], selected['subject_rows']
+    treaty_rows, treaty_article_rows = selected['treaty_rows'], selected['treaty_article_rows']
+    market_rows, market_member_rows = selected['market_rows'], selected['market_member_rows']
+    market_state_rows, market_trade_goods_rows = selected['market_state_rows'], selected['market_trade_goods_rows']
+    company_rows, political_movement_rows = selected['company_rows'], selected['political_movement_rows']
+    war_rows, war_participant_rows = selected['war_rows'], selected['war_participant_rows']
+    diplomatic_play_rows, war_cost_rows = selected['diplomatic_play_rows'], selected['war_cost_rows']
+    war_goal_rows, military_formation_rows = selected['war_goal_rows'], selected['military_formation_rows']
+    battle_rows, battle_casualty_rows = selected['battle_rows'], selected['battle_casualty_rows']
     mark(82, "整理外交、战争、战斗、军队")
 
     rank_by_country = {row["country_id"]: row for row in rankings}
@@ -1843,6 +1811,7 @@ def build_system_export(path: Path, txt: str, limit: int = 30, full_pops: bool =
         "save": str(path),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "mode": "systems",
+        "extraction": extraction,
         "limit": limit,
         "full_pops": full_pops,
         "meta": meta_info,

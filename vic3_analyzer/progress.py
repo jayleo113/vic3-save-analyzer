@@ -7,6 +7,8 @@ import re
 import shutil
 import threading
 import time
+import sys
+import unicodedata
 
 
 class ProgressPrinter:
@@ -59,10 +61,17 @@ class ProgressPrinter:
 
     @staticmethod
     def _fit_line(text: str, previous_len: int) -> tuple[str, str]:
-        width = max(shutil.get_terminal_size((96, 20)).columns - 1, 48)
-        if len(text) > width:
-            text = text[: max(width - 3, 1)] + "..."
-        padding = " " * max(0, previous_len - len(text))
+        width = max(shutil.get_terminal_size((96, 20)).columns - 1, 1)
+        fitted = ''
+        cells = 0
+        for char in text:
+            size = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in 'WF' else 1
+            if cells + size > width:
+                break
+            fitted += char
+            cells += size
+        text = fitted
+        padding = " " * max(0, min(previous_len, width) - cells)
         return text, padding
 
     def _step(self, percent: int) -> tuple[int, str]:
@@ -81,11 +90,13 @@ class ProgressPrinter:
             step_index, step_name = self._step(percent)
             detail = self._short_label(label)
             current = "完成" if percent >= 100 else detail or step_name
-            text = f"{self.title}  {step_index:02d}/{len(self.steps):02d}  {percent:3d}%  {current}"
+            text = f"{self.title} · {current}"
             if not force and text == self.last_text:
                 return
             self.last_text = text
-        text, padding = self._fit_line(text, self.line_len)
-        print("\r" + text + padding, end="", flush=True)
-        self.line_len = len(text)
-        self.has_line = True
+            if not sys.stdout.isatty():
+                return
+            text, padding = self._fit_line(text, self.line_len)
+            print("\r" + text + padding, end="", flush=True)
+            self.line_len = sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in text)
+            self.has_line = True

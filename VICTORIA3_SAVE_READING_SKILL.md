@@ -13,6 +13,8 @@ Use this project-local skill when the user asks to read, parse, export, compare,
 - User-facing output: `F:\vic3-save-analyzer\exports\<country>_<game-date>\`
 - Desktop MD library: `%USERPROFILE%\Desktop\Victoria3存档MD报告\`
 - Local API data cache: `F:\vic3-save-analyzer\data_cache\`
+- Persistent save catalog: `F:\vic3-save-analyzer\data_cache\save_catalog.json`
+- Content reuse index: `F:\vic3-save-analyzer\data_cache\content_index.json`
 - MD library cache manifest: `F:\vic3-save-analyzer\data_cache\md_library\md_library_manifest.json`
 - Exported files must be prefixed with the save's in-game country name and in-game date, for example `瑞士_1858-08-04_systems_wars.csv`.
 - System exports should include market tables, political movements, formal treaties, and treaty articles alongside the existing economy, population, diplomacy, and war tables.
@@ -46,10 +48,10 @@ Avoid defaulting to "what should I do next". Only give strategy advice when the 
 The launcher menu should stay simple:
 
 ```text
-[1] MD 资料库
-[2] 完整导出
-[3] AI / API
-[0] 退出
+1. MD 资料库
+2. 完整导出
+3. AI / API
+0. 退出
 ```
 
 MD-only desktop export should generate a data-first full-country report, but leave only one `.md` file directly under `%USERPROFILE%\Desktop\Victoria3存档MD报告\`, named like `<country>_<game-date>_体系化国家报告.md`.
@@ -65,8 +67,11 @@ Current split modules:
 - `vic3_analyzer/parser_core.py`: low-level Jomini brace/database parsing helpers
 - `vic3_analyzer/country_names.py`: country tag to Chinese display-name mapping, with localization-file support
 - `vic3_analyzer/formatting.py`: filename, number, Markdown table, CSV/JSON helpers
-- `vic3_analyzer/data_store.py`: SQLite mirror for generated API datasets
-- `vic3_analyzer/save_reader.py`: text/zip/binary save reading and Garibaldi/Rakaly melt bridge
+- `vic3_analyzer/data_store.py`: SQLite and JSONL mirrors for generated API datasets
+- `vic3_analyzer/fingerprint.py`: fast save fingerprints for cache validation
+- `vic3_analyzer/save_catalog.py`: persistent save preview catalog for fast save picking
+- `vic3_analyzer/external_tools.py`: optional Garibaldi/Rakaly/Jomini backend discovery
+- `vic3_analyzer/save_reader.py`: text/zip/binary save reading, native extraction, and Garibaldi/Rakaly melt bridge
 - `vic3_analyzer/metrics.py`: numeric parsing, trend extraction, date sort helpers
 - `vic3_analyzer/buildings.py`: building scan, building sector classification, construction queue parsing
 - `vic3_analyzer/states.py`: state ownership, infrastructure, devastation, state trade-goods parsing
@@ -81,7 +86,16 @@ One-click export should:
 4. Export fixed CSV/JSON tables.
 5. Copy outputs into categorized F-drive export folders.
 
-API/data-cache exports should additionally create `dataset.sqlite` inside `F:\vic3-save-analyzer\data_cache\<dataset>\`. Keep Markdown and CSV as transparent source artifacts, but use SQLite for repeated API reads and future filtering/query features.
+API/data-cache exports should additionally create `dataset.sqlite` and `tables/*.jsonl` inside `F:\vic3-save-analyzer\data_cache\<dataset>\`. Keep Markdown and CSV as transparent source artifacts, use SQLite for repeated filtering/query features, and use JSONL for large table reads.
+
+v0.3 cache rules:
+
+- Save selection should use the persistent catalog and only refresh an entry when file size or modified timestamp changes.
+- Dataset reuse must check source path, size, modified time, options, parser schema, and fast content fingerprint.
+- Identical save content should reuse matching dataset views through `content_index.json` even when the file path or manual save name differs.
+- Rebuild SQLite/JSONL mirrors from existing CSVs when only mirror schema changes; avoid reparsing `.v3` when possible.
+- Prefer project-local `data_cache/melted/` and `data_cache/native_extract/` for expanded saves. Avoid `%TEMP%`/C-drive temporary outputs for large files.
+- Detect optional backends in this order: future Jomini extractor, Garibaldi native extractor, Garibaldi/Rakaly melter, Rakaly CLI, Python text/zip reader.
 
 Terminal progress should stay compact and human-readable:
 
@@ -103,7 +117,9 @@ Local data API should:
 2. Expose save listing through `/api/saves`.
 3. Expose disk-backed data builds through `/api/build` and the compatibility alias `/api/export`.
 4. Expose every fixed systems table through `/api/table/<table_name>`.
-5. Reuse generated outputs from `data_cache/` instead of reparsing the save for every table request.
+5. Expose SQLite table reads through `/api/sql/table/<table_name>`.
+6. Expose JSONL table reads through `/api/jsonl/table/<table_name>`.
+7. Reuse generated outputs from `data_cache/` instead of reparsing the save for every table request.
 
 Public conversation API should:
 

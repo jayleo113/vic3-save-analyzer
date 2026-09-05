@@ -6,39 +6,35 @@ from __future__ import annotations
 import re
 
 _DATABASE_BLOCK_CACHE: dict[tuple[int, str], tuple[str, str | None]] = {}
+_ENTRY_HEADER = re.compile(r"([^\s={}]+)\s*=")
+_STRUCTURE = re.compile(r'"(?:\\.|[^"\\])*"|#[^\r\n]*|[{}]')
+_ROOT_HEADER = re.compile(r'(?m)^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{')
+_ROOT_INDEX: dict[int, tuple[str, dict[str, int]]] = {}
 
 
 def clear_database_block_cache(txt: str | None = None) -> None:
     if txt is None:
         _DATABASE_BLOCK_CACHE.clear()
+        _ROOT_INDEX.clear()
         return
     txt_id = id(txt)
+    _ROOT_INDEX.pop(txt_id, None)
     for key in [key for key in _DATABASE_BLOCK_CACHE if key[0] == txt_id]:
         del _DATABASE_BLOCK_CACHE[key]
 
 
 def brace_span(txt: str, start: int) -> int:
+    if start < 0 or start >= len(txt) or txt[start] != '{':
+        raise ValueError('Expected opening brace')
     depth = 0
-    in_string = False
-    escape = False
-    for pos in range(start, len(txt)):
-        char = txt[pos]
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
+    for match in _STRUCTURE.finditer(txt, start):
+        char = match.group(0)
+        if char == "{":
             depth += 1
         elif char == "}":
             depth -= 1
             if depth == 0:
-                return pos
+                return match.start()
     raise ValueError("花括号不匹配")
 
 
@@ -52,10 +48,16 @@ def block_after(txt: str, marker: str) -> tuple[str, int, int] | None:
 
 
 def top_level_block(txt: str, key: str) -> tuple[str, int, int] | None:
-    match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*\{{", txt)
-    if not match:
+    cached = _ROOT_INDEX.get(id(txt))
+    if not cached or cached[0] is not txt:
+        positions = {}
+        for match in _ROOT_HEADER.finditer(txt):
+            positions.setdefault(match.group(1), match.end() - 1)
+        cached = (txt, positions)
+        _ROOT_INDEX[id(txt)] = cached
+    open_pos = cached[1].get(key)
+    if open_pos is None:
         return None
-    open_pos = txt.find("{", match.start())
     close = brace_span(txt, open_pos)
     return txt[open_pos + 1 : close], open_pos, close
 
@@ -106,12 +108,12 @@ def iter_top_blocks(txt: str, start: int, end: int):
         if txt[pos] in " \t\r\n":
             pos += 1
             continue
-        match = re.match(r"([^\s={}]+)\s*=", txt[pos:end])
+        match = _ENTRY_HEADER.match(txt, pos, end)
         if not match:
             pos += 1
             continue
         key = match.group(1)
-        value_pos = pos + match.end()
+        value_pos = match.end()
         while value_pos < end and txt[value_pos] in " \t\r\n":
             value_pos += 1
         if value_pos < end and txt[value_pos] == "{":

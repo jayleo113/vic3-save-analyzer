@@ -16,13 +16,16 @@ python analyze.py report --full  # 完整扫描人口明细，较慢
 python analyze.py report <存档路径> # 分析指定存档
 python analyze.py --json doctor  # 检查环境，机器可读
 python analyze.py --json latest  # 返回最新存档路径
-python analyze.py --json community # 查看社区后端与 Rakaly 状态
+python analyze.py --json community # 查看社区后端、Rakaly、Garibaldi/Jomini 加速状态
 python analyze.py melt <存档路径> # 用 Garibaldi/Rakaly 转换二进制存档
 python analyze.py systems        # 固定模板导出主要国家体系表
 python analyze.py systems --limit 30
+python api_server.py saves       # 快速列出存档
+python api_server.py status      # 查看读取后端与缓存状态
+python api_server.py build --save latest
 ```
 
-用户也可以直接双击本目录的 `启动维多利亚3存档读取器.bat`，菜单里有快速分析、体系导出和 API分析。
+用户也可以直接双击本目录的 `启动维多利亚3存档读取器.bat`，菜单里有 MD 资料库、完整导出和 AI/API。
 
 ## 存档位置（Windows）
 
@@ -38,14 +41,14 @@ C:\Users\<用户名>\Documents\Paradox Interactive\Victoria 3\save games\*.v3
 - GDP 前十、人口前十
 - 玩家国家州、建筑、法律
 - 玩家国家人口明细与职业/文化/宗教结构（需要 `--full`）
-- CSV 与 `summary.json`，方便后续预测、实验或接 API
+- CSV、JSON、SQLite 与 JSONL，方便后续预测、实验或接 API
 - 主要国家固定体系导出：国家总表、州、建筑、人口、法律、利益集团、科技、关系、条约
 
 ## 社区集成策略
 
 - 优先借用社区：Garibaldi 的指标体系与 Rakaly melter，vic3-reader 的 parser/metrics/orchestrator 分层方法。
 - 保留自写层：中文报告、用户本地路径、模组兼容、API 菜单、社会学分析口径。
-- API Key 配置保存在 `C:\Users\<用户名>\.vic3-save-analyzer\api_config.json`，不要在报告正文里输出密钥。
+- API Key 配置保存在项目内 `F:\vic3-save-analyzer\config\api_config.json`，不要在报告正文里输出密钥。
 
 ## 深入分析指南
 
@@ -64,3 +67,4 @@ C:\Users\<用户名>\Documents\Paradox Interactive\Victoria 3\save games\*.v3
 - 解析顶层管理器时优先匹配行首 `manager={`，避免误抓国家内部字段，例如国家块里的 `states={...}`。
 - 国家标签（tag）→ 中文名可查游戏本地化文件 `game/localization/simp_chinese/countries_l_simp_chinese.yml`。
 - 文化数字 ID → 名称：优先查存档内 `cultures.database` 的 `type` 字段；宗教通常已在 pop 字段内保存为文本键。
+- v0.3 起先走 `data_cache/save_catalog.json` 快速预览，再通过标准数据包复用 `dataset.sqlite` 与 `tables/*.jsonl`。

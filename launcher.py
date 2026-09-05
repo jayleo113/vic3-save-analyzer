@@ -14,16 +14,15 @@ import sys
 import time
 import urllib.error
 import urllib.request
-import zipfile
 from datetime import datetime
 from pathlib import Path
 
 import analyze
-from vic3_analyzer import md_library, terminal_ui
+from vic3_analyzer import external_tools, md_library, save_catalog, terminal_ui
 from vic3_analyzer.progress import ProgressPrinter
 
 
-APP_VERSION = "0.2"
+APP_VERSION = "0.3"
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = PROJECT_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "api_config.json"
@@ -219,35 +218,15 @@ def list_save_paths() -> list[Path]:
 
 
 def file_size_label(size: int) -> str:
-    if size >= 1024 * 1024 * 1024:
-        return f"{size / (1024 * 1024 * 1024):.1f}GB"
-    if size >= 1024 * 1024:
-        return f"{size / (1024 * 1024):.1f}MB"
-    if size >= 1024:
-        return f"{size / 1024:.1f}KB"
-    return f"{size}B"
+    return save_catalog.file_size_label(size)
 
 
 def save_source_label(path: Path) -> str:
-    text = str(path).lower()
-    if "\\steam\\userdata\\" in text or "/steam/userdata/" in text:
-        return "Steam云"
-    if "\\onedrive\\" in text or "/onedrive/" in text:
-        return "OneDrive"
-    return "本地文档"
+    return save_catalog.save_source_label(path)
 
 
 def read_save_preview_text(path: Path, max_bytes: int = PREVIEW_BYTES) -> str:
-    with path.open("rb") as handle:
-        magic = handle.read(4)
-    if magic.startswith(b"PK"):
-        with zipfile.ZipFile(path) as zf:
-            names = zf.namelist()
-            target = "gamestate" if "gamestate" in names else names[0]
-            with zf.open(target) as handle:
-                return handle.read(max_bytes).decode("utf-8", errors="replace")
-    with path.open("rb") as handle:
-        return handle.read(max_bytes).decode("utf-8", errors="replace")
+    return save_catalog._read_preview_text(path, max_bytes)
 
 
 def preview_value(text: str, key: str) -> str:
@@ -258,13 +237,7 @@ def preview_value(text: str, key: str) -> str:
 
 
 def filename_save_hint(path: Path) -> tuple[str, str]:
-    stem = path.stem.strip()
-    match = re.search(r"(.+?)[_\-\s]+(\d{4})[_\-\s]+(\d{1,2})[_\-\s]+(\d{1,2})", stem)
-    if match:
-        country = match.group(1).strip("_- ")
-        year, month, day = match.group(2), int(match.group(3)), int(match.group(4))
-        return country or stem, f"{year}-{month:02d}-{day:02d}"
-    return stem, ""
+    return save_catalog.filename_save_hint(path)
 
 
 def save_preview(path: Path) -> dict:
@@ -273,41 +246,10 @@ def save_preview(path: Path) -> dict:
     cached = SAVE_PREVIEW_CACHE.get(cache_key)
     if cached:
         return cached
-    try:
-        text = read_save_preview_text(path)
-        filename_country, filename_date = filename_save_hint(path)
-        raw_date = preview_value(text, "game_date") or preview_value(text, "date")
-        raw_country = preview_value(text, "name") or filename_country or analyze.safe_filename_part(path.stem, "未知国家")
-        country = analyze.country_names.display_name(raw_country, analyze.COUNTRY_NAMES)
-        version = preview_value(text, "version") or "未知版本"
-        rank = preview_value(text, "rank") or "未知地位"
-        preview = {
-            "path": path,
-            "country": country,
-            "date": analyze.normalize_game_date(raw_date) if raw_date else filename_date or "未知日期",
-            "version": version,
-            "rank": rank,
-            "size": file_size_label(stat.st_size),
-            "source": save_source_label(path),
-            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-            "status": "可读",
-        }
-        SAVE_PREVIEW_CACHE[cache_key] = preview
-        return preview
-    except Exception as exc:
-        preview = {
-            "path": path,
-            "country": "读取失败",
-            "date": "未知日期",
-            "version": "未知版本",
-            "rank": "未知地位",
-            "size": file_size_label(stat.st_size),
-            "source": save_source_label(path),
-            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-            "status": str(exc)[:40],
-        }
-        SAVE_PREVIEW_CACHE[cache_key] = preview
-        return preview
+    preview = dict(save_catalog.preview(path, DATA_CACHE_ROOT, analyze.COUNTRY_NAMES))
+    preview["path"] = path
+    SAVE_PREVIEW_CACHE[cache_key] = preview
+    return preview
 
 
 def choose_save_path() -> Path | None:
@@ -446,7 +388,9 @@ def keep_only_md_report(run_dir: Path, document: Path, path: Path, outputs: dict
         stem = stem[: -len("_systems_document.md")]
     else:
         stem = desktop_md_label(path)
-    final_report = md_library.copy_report_to_library(document, run_dir, f"{stem}_体系化国家报告.md")
+    country, date = md_library.report_identity(document)
+    final_name = md_library.canonical_report_name(country if country != "未知" else stem, date)
+    final_report = md_library.copy_report_to_library(document, run_dir, final_name)
     generated = {Path(item).resolve() for item in outputs.values()}
     generated.add(document.resolve())
     for item in generated:
@@ -580,21 +524,11 @@ def print_cached_md_summary(started: float, report: Path) -> None:
 
 
 def existing_valid_md_report_for_save(path: Path) -> Path | None:
-    preview = save_preview(path)
-    country = analyze.safe_filename_part(preview.get("country"), "未知国家")
-    date = analyze.safe_filename_part(preview.get("date"), "未知日期")
-    if date in {"未知日期", "DATE_UNKNOWN"}:
-        return None
-    prefix = f"{country}_{date}_体系化国家报告"
-    candidates = sorted(DESKTOP_MD_ROOT.glob(f"{prefix}*.md"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for report in candidates:
-        if not md_library.validate_report(report):
-            md_library.remember_report(path, report, MD_CACHE_ROOT)
-            return report
-    return None
+    return md_library.cached_report_for_save(path, DESKTOP_MD_ROOT, MD_CACHE_ROOT)
 
 
 def run_desktop_md_export(path: Path | None = None, open_folder: bool = True, quiet_summary: bool = False) -> Path | None:
+    import api_server
     latest_mode = path is None
     print("\n导出全量 MD 数据文档")
     started = time.time()
@@ -620,24 +554,20 @@ def run_desktop_md_export(path: Path | None = None, open_folder: bool = True, qu
     txt = None
     try:
         progress(1, "找到最新存档" if latest_mode else f"已选择存档：{path.name}")
-        progress(5, "读取并展开存档")
-        txt = analyze.read_save(path)
-        progress(18, "存档读取完成")
-        run_dir = prepare_desktop_md_output(path)
-        progress(20, "创建桌面文件夹")
-        document, outputs = analyze.build_system_export(
-            path,
-            txt,
-            limit=0,
-            full_pops=True,
-            progress=lambda p, label: progress(20 + int(p * 0.76), label),
-        )
-        progress(97, "整理单个MD报告")
-        report = keep_only_md_report(run_dir, document, path, outputs)
-        md_library.remember_report(path, report, MD_CACHE_ROOT)
+        manifest = api_server.build_dataset(path, limit=0, full_pops=True, progress=lambda p, label: progress(int(p * .96), label if p < 100 else '写入MD报告'))
+        run_dir = DESKTOP_MD_ROOT
+        document = api_server.output_path(manifest, 'systems_document')
+        identity = manifest['source']
+        name = md_library.canonical_report_name(identity['game_country'], identity['game_date'])
+        report = md_library.copy_report_to_library(document, run_dir, name)
         issues = md_library.validate_report(report)
         if issues:
-            print("\n自检提醒：" + "；".join(issues))
+            raise RuntimeError('报告校验失败：' + '；'.join(issues))
+        from vic3_analyzer.fingerprint import full_hash
+        if full_hash(path) != identity['sha256']:
+            raise RuntimeError('存档已变化，请保存完成后重试')
+        md_library.remember_report(path, report, MD_CACHE_ROOT, expected_hash=identity['sha256'])
+        write_desktop_md_index()
         progress(100, "完成")
     except Exception as exc:
         progress.stop()
@@ -676,6 +606,9 @@ def run_desktop_md_batch(paths: list[Path]) -> None:
     print(f"耗时：{elapsed}")
     print(f"成功：{len(completed)}")
     print(f"失败：{len(failed)}")
+    for failed_path, reason in failed:
+        preview = save_preview(failed_path)
+        print(f"  {preview.get('country', '未知国家')} {preview.get('date', '未知日期')} · {failed_path.name}：{reason}")
     print(f"位置：{DESKTOP_MD_ROOT}")
     terminal_ui.open_folder(DESKTOP_MD_ROOT)
 
@@ -684,7 +617,7 @@ def desktop_md_menu() -> None:
     while True:
         choice = terminal_ui.menu(
             f"Victoria 3 存档读取器 v{APP_VERSION}",
-            [("1", "导出最新存档为单个 MD"), ("2", "选择多个存档批量导出 MD"), ("3", "导出全部存档 MD"), ("0", "返回")],
+            [("1", "导出最新存档为单个 MD"), ("2", "选择多个存档批量导出 MD"), ("3", "整理资料库命名与索引"), ("4", "导出全部存档 MD"), ("0", "返回")],
             subtitle="MD 资料库",
             footer=f"输出位置：{DESKTOP_MD_ROOT}",
         )
@@ -699,6 +632,12 @@ def desktop_md_menu() -> None:
                 run_desktop_md_batch(selected)
             pause()
         elif choice == "3":
+            result = md_library.organize_library(DESKTOP_MD_ROOT)
+            index = write_desktop_md_index()
+            terminal_ui.done([("重命名", result.get("renamed", 0)), ("归档重复", result.get("archived", 0)), ("索引", index), ("文件夹", DESKTOP_MD_ROOT)])
+            terminal_ui.open_folder(DESKTOP_MD_ROOT)
+            pause()
+        elif choice == "4":
             paths = list_save_paths()
             if paths:
                 run_desktop_md_batch(paths)
@@ -943,11 +882,37 @@ def run_data_api_command(*args: str) -> None:
     subprocess.run([sys.executable, str(script), *args])
 
 
+def print_accelerator_status() -> None:
+    status = external_tools.status(PROJECT_DIR)
+    terminal_ui.title("读取加速诊断")
+    active = status.get("active_backends", [])
+    print("当前后端：" + ("、".join(active) if isinstance(active, list) and active else "Python 回退"))
+    rows = [
+        ("Rust 顶层块扫描器", status.get("rust_scanner") or "未编译"),
+        ("Jomini 专用提取器", status.get("jomini_extractor") or "未安装"),
+        ("Garibaldi 原生提取器", status.get("garibaldi_native_extractor") or "未安装"),
+        ("Garibaldi/Rakaly melter", status.get("garibaldi_melter") or "未安装"),
+        ("Rakaly CLI", status.get("rakaly_cli") or "未安装"),
+        ("数据缓存", DATA_CACHE_ROOT),
+    ]
+    for name, value in rows:
+        print(f"{name}：{value}")
+
+
 def data_api_menu() -> None:
     while True:
         choice = terminal_ui.menu(
             f"Victoria 3 存档读取器 v{APP_VERSION}",
-            [("1", "为最新存档建库"), ("2", "选择存档建库"), ("3", "查看已有数据包"), ("4", "启动本地 API"), ("5", "启动公网 API"), ("0", "返回")],
+            [
+                ("1", "为最新存档建库"),
+                ("2", "选择存档建库"),
+                ("3", "查看已有数据包"),
+                ("4", "启动本地 API"),
+                ("5", "启动公网 API"),
+                ("6", "查看内容复用索引"),
+                ("7", "读取加速诊断"),
+                ("0", "返回"),
+            ],
             subtitle="数据 API",
             footer=f"数据仓库：{DATA_CACHE_ROOT}",
         )
@@ -969,6 +934,12 @@ def data_api_menu() -> None:
             pause()
         elif choice == "5":
             run_public_data_api()
+            pause()
+        elif choice == "6":
+            run_data_api_command("content")
+            pause()
+        elif choice == "7":
+            print_accelerator_status()
             pause()
 
 
@@ -1008,25 +979,87 @@ def ai_api_menu() -> None:
             data_api_menu()
 
 
+def run_v03_acceptance_check() -> None:
+    terminal_ui.section("v0.3 验收检查")
+    print("会检查最新存档导出、缓存复用、换范围复用、本地 API 表读取和历史对照。")
+    print("结果写入 F 盘项目的 data_cache/benchmarks，不会上传 GitHub。")
+    script = PROJECT_DIR / "scripts" / "v03_acceptance.py"
+    try:
+        subprocess.run([sys.executable, str(script)], cwd=str(PROJECT_DIR))
+    except KeyboardInterrupt:
+        print("\n已停止")
+
+
 def main() -> None:
     while True:
         config = load_config()
         choice = terminal_ui.menu(
             f"Victoria 3 存档读取器 v{APP_VERSION}",
-            [("1", "MD 资料库"), ("2", "完整导出"), ("3", "AI / API"), ("0", "退出")],
-            subtitle="选择你要做的事",
-            footer=f"MD库：{DESKTOP_MD_ROOT}\nAPI：{saved_label(config)}",
+            [("1", "导出最新 MD"), ("2", "选择存档批量导出"), ("3", "资料库与设置"), ("0", "退出")],
+            footer=f"报告位置：{DESKTOP_MD_ROOT}",
         )
         if not choice:
             sys.exit(0)
         if choice == "1":
-            desktop_md_menu()
+            run_desktop_md_export()
+            pause()
         elif choice == "2":
-            full_export_menu()
+            selected = choose_save_paths_multi()
+            if selected:
+                run_desktop_md_batch(selected)
+            pause()
         elif choice == "3":
-            ai_api_menu()
+            settings_menu()
         elif choice == "0":
             sys.exit(0)
+
+
+def settings_menu() -> None:
+    while True:
+        choice = terminal_ui.menu(
+            '资料库与设置',
+            [('1', 'MD 资料库'), ('2', '完整分类导出'), ('3', 'AI / API'), ('4', '历史存档对照'), ('5', 'v0.3 验收检查'), ('0', '返回')],
+        )
+        if choice in {'', '0'}:
+            return
+        {'1': desktop_md_menu, '2': full_export_menu, '3': ai_api_menu, '4': history_menu, '5': run_v03_acceptance_check}.get(choice, lambda: None)()
+
+
+def history_menu() -> None:
+    import api_server
+    from vic3_analyzer import history
+    from vic3_analyzer.cache_io import atomic_bytes
+    datasets = api_server.list_datasets()
+    if len(datasets) < 2:
+        print('请先导出同一局游戏的至少两个存档。')
+        pause()
+        return
+    for i, item in enumerate(datasets, 1):
+        source = item['source']
+        print(f"{i}. {source.get('country')}  {source.get('date')}")
+    print()
+    print('输入两个编号生成两点对照；输入三个以上编号生成战役时间线。')
+    raw = terminal_ui.ask('选择同一局存档编号（如 2,1 或 5,4,3,2,1）：')
+    try:
+        indices = [int(s.strip()) - 1 for s in raw.replace('，', ',').split(',')]
+        if len(indices) < 2 or len(set(indices)) != len(indices) or any(i < 0 or i >= len(datasets) for i in indices):
+            raise ValueError('请选择至少两个不同的存档')
+        selected = [datasets[i] for i in indices]
+        first, second = selected[0], selected[-1]
+        if len(selected) == 2:
+            body = history.compare(first, second)
+            prefix = "历史对照"
+        else:
+            body = history.timeline(selected)
+            prefix = "战役时间线"
+        name = analyze.safe_filename_part(f"{prefix}_{first['source']['country']}_{first['source']['date']}_至_{second['source']['country']}_{second['source']['date']}")
+        target = DESKTOP_MD_ROOT / (name + '.md')
+        atomic_bytes(target, body.encode('utf-8'))
+        terminal_ui.done([('报告', target)])
+        terminal_ui.open_folder(DESKTOP_MD_ROOT)
+    except (ValueError, OSError, RuntimeError) as exc:
+        terminal_ui.failed(exc)
+    pause()
 
 
 if __name__ == "__main__":

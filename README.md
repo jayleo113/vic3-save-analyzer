@@ -1,6 +1,10 @@
 # Victoria 3 Save Analyzer / Vic3 存档读取器
 
-Current version: v0.2
+Current version: v0.3
+
+Next target: v0.4 will focus on historical comparison groups and a complete world-chain timeline across multiple saves.
+
+维护规则见 [AGENTS.md](AGENTS.md)；第五至第九项的实现、实测和限制见 [v0.3 验收记录](docs/V0.3_ACCEPTANCE.md)。下一阶段目标见 [v0.4 路线：历史对照与完整世界链](docs/V0.4_ROADMAP.md)。
 
 Victoria 3 save parser and report exporter for Paradox grand strategy saves. It extracts country systems, GDP share, historical trends, buildings, companies, population structure, laws, interest groups, diplomacy, wars, and historical wars into Markdown, CSV, and JSON reports.
 
@@ -12,7 +16,7 @@ Victoria 3, Vic3, Victoria 3 save analyzer, Victoria 3 save parser, Vic3 save re
 
 ## Features
 
-- One-click Windows export into the project-local `exports/` folder.
+- One-click Windows export into the desktop Markdown report library.
 - Reads the latest Victoria 3 `.v3` save automatically.
 - Supports text saves, ZIP saves, and optional binary-save melting through Garibaldi/Rakaly.
 - Exports systematic country dossiers in Markdown.
@@ -21,12 +25,18 @@ Victoria 3, Vic3, Victoria 3 save analyzer, Victoria 3 save parser, Vic3 save re
 - Exports companies and enterprise productivity trends.
 - Exports population by job, culture, religion, loyalists, radicals, workforce, and dependents.
 - Exports markets, market members, state trade goods, laws, political movements, interest groups, technology, relations, pacts, formal treaties, treaty articles, diplomatic plays, war goals, armies/navies, battles, casualties, wars, historical wars, and state ownership-change clues.
-- Builds a readable war/unrest/territorial-change timeline from wars, diplomatic plays, war goals, battles, casualties, and state owner-change fields.
+- Builds explicit two-save comparisons and multi-save timelines from wars, diplomatic plays, war goals, battles, casualties, subjects, markets, treaties, laws, movements, and state owner-change fields.
 - Maintains a desktop Markdown library with `00_资料库索引.md` for chat-model handoff when local APIs are unavailable.
 - Desktop Markdown export is a data-first full-country document; interpretation is intentionally left to API or other analysis frameworks.
 - Reuses unchanged Markdown reports through a disk-backed cache, so repeated exports of the same save return immediately.
-- Shows a compact single-line export progress indicator with step count and remaining scan items.
-- Provides a local HTTP data API for save listing, disk-backed data builds, and per-table JSON reads.
+- Shows a compact single-line status with real scan counts, without simulated completion times.
+- Provides a local HTTP data API for save listing, disk-backed data builds, per-table JSON reads, SQLite queries, and JSONL table reads.
+- Uses a persistent save catalog and fast content fingerprints so unchanged saves can be identified without deep rescans.
+- Reuses identical save content through `data_cache/content_index.json`, so copied or renamed saves can still find an existing dataset view.
+- Stores reusable world modules in `data_cache/snapshots.sqlite`; country scopes share the same extraction.
+- Writes reusable data packages under `data_cache/`; the JSONL-compatible table endpoint reads SQLite on demand.
+- Compares explicitly selected historical snapshots, including territory, subjects, laws, markets, treaties, movements and recorded wars.
+- Detects optional acceleration backends: Garibaldi native extractor, Garibaldi/Rakaly melter, Rakaly CLI, and the optional Rust top-level block scanner.
 - Optional DeepSeek/OpenAI-compatible API report mode for classified tables.
 
 ## Quick Start
@@ -48,10 +58,10 @@ run-analyzer.bat
 Launcher menu:
 
 ```text
-[1] MD 资料库
-[2] 完整导出
-[3] AI / API
-[0] 退出
+1. 导出最新 MD
+2. 选择存档批量导出
+3. 资料库与设置
+0. 退出
 ```
 
 The default save folder is:
@@ -60,7 +70,7 @@ The default save folder is:
 C:\Users\<username>\Documents\Paradox Interactive\Victoria 3\save games
 ```
 
-UI exports are written to the project folder on F drive:
+Default Markdown reports go directly into the desktop `Victoria3存档MD报告` folder. Intermediate files stay in the project. Optional categorized exports are written to:
 
 ```text
 F:\vic3-save-analyzer\exports\<country>_<game-date>\
@@ -69,8 +79,10 @@ F:\vic3-save-analyzer\exports\<country>_<game-date>\
 The MD-only desktop option writes a single rich Markdown report to:
 
 ```text
-C:\Users\<username>\Desktop\Victoria3存档MD报告\<country>_<game-date>_体系化国家报告.md
+C:\Users\<username>\Desktop\Victoria3存档MD报告\<中文国家>_<game-date>_国家报告.md
 ```
+
+The library index groups reports by Chinese country name and sorts each country by game date. Older duplicate reports are moved to `_旧版重复报告` so the first folder level stays easy to scan.
 
 Inside that option:
 
@@ -91,9 +103,32 @@ C:\Users\<username>\Desktop\Victoria3存档MD报告\00_资料库索引.md
 
 If the same save file has already been exported and its size/modified time has not changed, the launcher reuses the existing report instead of scanning the full save again.
 
+## v0.3 Data Pipeline
+
+```text
+.v3 save
+  -> persistent save catalog
+  -> text/zip reader or optional native extractor
+  -> reusable world modules
+  -> standard data package
+  -> Markdown / SQLite / API
+```
+
+The save picker uses `data_cache/save_catalog.json` and refreshes an entry only when the file size or modified timestamp changes. API datasets also store a fast content fingerprint, so manual saves with confusing names do not silently reuse the wrong cache.
+
+Exact dataset views are content-addressed through `data_cache/content_index.json`: if a save is copied or renamed but the quick content fingerprint is unchanged, `api_server.py build` can reuse the existing matching dataset instead of scanning again.
+
+Diagnostic command:
+
+```powershell
+python api_server.py status
+```
+
+See [docs/V0.3_TECH_STACK.md](docs/V0.3_TECH_STACK.md). Rust acceleration design is documented in [docs/RUST_ACCELERATION.md](docs/RUST_ACCELERATION.md).
+
 ## Current Modularization
 
-The first v0.2 refactor split user-facing helpers out of the original analyzer:
+The analyzer is split into maintainable helper modules:
 
 ```text
 vic3_analyzer/md_library.py      Markdown library, index, cache, report self-checks
@@ -103,8 +138,15 @@ vic3_analyzer/parser_core.py     low-level Jomini brace/database parsing helpers
 vic3_analyzer/country_names.py   country tag to Chinese display-name mapping
 vic3_analyzer/formatting.py      filename, number, Markdown table, CSV/JSON helpers
 vic3_analyzer/data_store.py      SQLite mirror for generated API datasets
+vic3_analyzer/fingerprint.py     fast save fingerprints for cache validation
+vic3_analyzer/save_catalog.py    persistent save preview catalog
+vic3_analyzer/external_tools.py  optional Garibaldi/Rakaly/Jomini/Rust backend discovery
 vic3_analyzer/save_reader.py     text/zip/binary save reading and Garibaldi/Rakaly melt bridge
 vic3_analyzer/metrics.py         numeric parsing, trend extraction, date sort helpers
+vic3_analyzer/snapshot_store.py  reusable module snapshots and content-addressed objects
+vic3_analyzer/world_data.py      one-pass world extraction and selected-country views
+vic3_analyzer/history.py         two-save comparisons and multi-save timelines
+vic3_analyzer/rust_backend.py    optional Rust scanner discovery and wrapper
 vic3_analyzer/buildings.py       building scan, building sector classification, construction queue parsing
 vic3_analyzer/states.py          state ownership, infrastructure, devastation, state trade-goods parsing
 vic3_analyzer/pops.py            population scan, workforce/dependent, culture/religion/job aggregation
@@ -179,7 +221,10 @@ python analyze.py --json latest
 python analyze.py --json community
 python analyze.py melt "C:\path\to\save.v3"
 python api_server.py build --save latest
+python api_server.py saves
 python api_server.py list
+python api_server.py content
+python api_server.py status
 python api_server.py serve
 python public_api.py
 ```
@@ -209,9 +254,10 @@ Each built dataset keeps the original Markdown/CSV files and also writes:
 
 ```text
 F:\vic3-save-analyzer\data_cache\<dataset>\dataset.sqlite
+F:\vic3-save-analyzer\data_cache\<dataset>\tables\*.jsonl
 ```
 
-The SQLite mirror is versioned separately from the save parser. When index rules change, the tool rebuilds only `dataset.sqlite` from existing CSV files instead of reparsing the full `.v3` save.
+The SQLite/JSONL mirrors are versioned separately from the save parser. When mirror rules change, the tool rebuilds them from existing CSV files instead of reparsing the full `.v3` save.
 
 Useful endpoints:
 
@@ -225,6 +271,7 @@ Useful endpoints:
 | `/api/table/major_countries?dataset=latest` | read one table as JSON |
 | `/api/sql/tables?dataset=latest` | list tables available in the SQLite mirror |
 | `/api/sql/table/major_countries?dataset=latest&limit=100` | read one table from SQLite |
+| `/api/jsonl/table/major_countries?dataset=latest&limit=100` | read one JSONL-backed table |
 | `/api/sql/query?dataset=latest&q=select * from major_countries limit 5` | run a read-only SQLite query |
 | `/api/table/markets?dataset=latest` | read market data as JSON |
 | `/api/table/population_by_culture?dataset=latest` | read culture population data as JSON |

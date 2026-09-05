@@ -1,0 +1,10 @@
+[package]
+name = "vic3_parser_rs"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Optional Victoria 3 save text scanner for vic3-save-analyzer."
+
+[[bin]]
+name = "vic3-scan"
+path = "src/main.rs"
